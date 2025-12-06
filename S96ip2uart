@@ -1,0 +1,88 @@
+#!/bin/sh
+# Simple control script for ip2uart (no start-stop-daemon, no PID files)
+
+DAEMON="ip2uart"
+DAEMON_CONF="/etc/ip2uart.conf"
+
+# Try to find PIDs using pidof, fall back to pgrep
+get_pids() {
+    if command -v pidof >/dev/null 2>&1; then
+        pidof "$DAEMON"
+    else
+        # -x to match scripts, -f to match full cmdline if needed
+        pgrep -x "$DAEMON" || pgrep -f "^$DAEMON[ ]"
+    fi
+}
+
+is_running() {
+    [ -n "$(get_pids)" ]
+}
+
+start() {
+    if is_running; then
+        echo "$DAEMON already running (PIDs: $(get_pids))"
+        return 0
+    fi
+
+    echo -n "Starting $DAEMON: "
+    "$DAEMON" -c "$DAEMON_CONF" >/dev/null 2>&1 &
+    # Give it a moment to spawn
+    sleep 0.2
+
+    if is_running; then
+        echo "OK (PIDs: $(get_pids))"
+        return 0
+    else
+        echo "FAIL"
+        return 1
+    fi
+}
+
+stop() {
+    if ! is_running; then
+        echo "$DAEMON is not running"
+        return 0
+    fi
+
+    echo -n "Stopping $DAEMON: "
+    PIDS="$(get_pids)"
+    # Try graceful TERM first
+    kill $PIDS 2>/dev/null
+
+    # Wait briefly, then escalate if needed
+    for _ in 1 2 3 4 5; do
+        sleep 0.2
+        is_running || { echo "OK"; return 0; }
+    done
+
+    # If still running, SIGKILL
+    kill -9 $(get_pids) 2>/dev/null
+    sleep 0.2
+    if is_running; then
+        echo "FAIL"
+        return 1
+    else
+        echo "OK"
+        return 0
+    fi
+}
+
+reload() {
+    if ! is_running; then
+        echo "$DAEMON is not running"
+        return 1
+    fi
+    echo -n "Reloading $DAEMON (SIGHUP): "
+    kill -HUP $(get_pids) 2>/dev/null && echo "OK" || echo "FAIL"
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; sleep 1; start ;;
+    reload)  reload ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|reload}"
+        exit 1
+        ;;
+esac
