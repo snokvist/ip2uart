@@ -92,8 +92,8 @@ typedef struct {
     // Selectors
     uart_backend_t uart_backend;   // tty | stdio
 
-    // CRSF parser
-    int  crsf_detect;              // 0 | 1
+    // Telemetry parsers
+    int  telemetry_detect;         // 0 | 1
     int  crsf_log;                 // 0 | 1
     char crsf_log_path[256];
     int  crsf_log_rate_ms;         // >= 0
@@ -160,6 +160,38 @@ typedef struct {
     double altitude_m;
     uint8_t sats;
 } crsf_log_state_t;
+
+typedef struct { uint8_t frame[300]; size_t len; size_t expected; } msp_stream_t;
+
+typedef struct { uint8_t frame[300]; size_t len; size_t expected; bool v2; } mav_stream_t;
+
+typedef enum {
+    TELEMETRY_PROTO_UNKNOWN = 0,
+    TELEMETRY_PROTO_CRSF,
+    TELEMETRY_PROTO_MSP,
+    TELEMETRY_PROTO_MAV
+} telemetry_proto_t;
+
+typedef struct {
+    bool enabled;
+    crsf_monitor_t crsf;
+
+    telemetry_proto_t protocol[CRSF_SRC_MAX];
+
+    uint8_t detect_tail[CRSF_SRC_MAX][2];
+    size_t detect_tail_len[CRSF_SRC_MAX];
+    size_t undecided_bytes[CRSF_SRC_MAX];
+
+    msp_stream_t msp_streams[CRSF_SRC_MAX];
+    uint64_t msp_frames[CRSF_SRC_MAX];
+    uint64_t msp_invalid[CRSF_SRC_MAX];
+
+    mav_stream_t mav_streams[CRSF_SRC_MAX];
+    uint64_t mav_frames[CRSF_SRC_MAX];
+    uint64_t mav_invalid[CRSF_SRC_MAX];
+
+    struct timespec last_report;
+} telemetry_monitor_t;
 
 /* --------------------------------- State ------------------------------------ */
 typedef struct {
@@ -272,7 +304,7 @@ static int parse_config(const char *path, config_t *cfg){
     memset(cfg,0,sizeof(*cfg));
     // Defaults
     cfg->uart_backend = UART_TTY;
-    cfg->crsf_detect = 0;
+    cfg->telemetry_detect = 0;
     cfg->crsf_log = 0;
     strcpy(cfg->crsf_log_path, "/tmp/crsf_log.msg");
     cfg->crsf_log_rate_ms = 100;
@@ -324,7 +356,7 @@ static int parse_config(const char *path, config_t *cfg){
 
         else if(!strcmp(key,"rx_buf")) cfg->rx_buf=(size_t)strtoul(val,NULL,10);
         else if(!strcmp(key,"tx_buf")) cfg->tx_buf=(size_t)strtoul(val,NULL,10);
-        else if(!strcmp(key,"crsf_detect")) cfg->crsf_detect=atoi(val);
+        else if(!strcmp(key,"telemetry_detect") || !strcmp(key,"crsf_detect")) cfg->telemetry_detect=atoi(val);
         else if(!strcmp(key,"crsf_log")) cfg->crsf_log=atoi(val);
         else if(!strcmp(key,"crsf_log_path")){
             strncpy(cfg->crsf_log_path, val, sizeof(cfg->crsf_log_path) - 1);
@@ -755,6 +787,311 @@ static void crsf_monitor_maybe_report(crsf_monitor_t *m)
     }
 }
 
+/* Telemetry monitor wrapper */
+static void telemetry_monitor_init(telemetry_monitor_t *m, bool enabled)
+{
+    memset(m, 0, sizeof(*m));
+    m->enabled = enabled;
+    crsf_monitor_init(&m->crsf, enabled);
+}
+
+static void telemetry_monitor_set_enabled(telemetry_monitor_t *m, bool enabled)
+{
+    if (m->enabled == enabled) return;
+    telemetry_monitor_init(m, enabled);
+}
+
+static void msp_stream_reset(msp_stream_t *s)
+{
+    s->len = 0;
+    s->expected = 0;
+}
+
+static void telemetry_monitor_feed_msp(telemetry_monitor_t *m, crsf_source_t src,
+                                       const uint8_t *data, size_t n)
+{
+    msp_stream_t *s = &m->msp_streams[src];
+
+    for (size_t i = 0; i < n; i++) {
+        uint8_t b = data[i];
+
+        if (s->len == 0) {
+            if (b == '$') {
+                s->frame[0] = b;
+                s->len = 1;
+            }
+            continue;
+        }
+
+        if (s->len == 1) {
+            if (b == 'M') {
+                s->frame[1] = b;
+                s->len = 2;
+            } else {
+                msp_stream_reset(s);
+                if (b == '$') {
+                    s->frame[0] = b;
+                    s->len = 1;
+                }
+            }
+            continue;
+        }
+
+        if (s->len == 2) {
+            if (b == '<' || b == '>') {
+                s->frame[2] = b;
+                s->len = 3;
+            } else {
+                msp_stream_reset(s);
+                if (b == '$') {
+                    s->frame[0] = b;
+                    s->len = 1;
+                }
+            }
+            continue;
+        }
+
+        if (s->len == 3) {
+            s->frame[3] = b;
+            s->len = 4;
+            size_t payload_len = b;
+            size_t total = payload_len + 6;
+            if (total < 6 || total > sizeof(s->frame)) {
+                m->msp_invalid[src]++;
+                msp_stream_reset(s);
+            } else {
+                s->expected = total;
+            }
+            continue;
+        }
+
+        if (s->len < sizeof(s->frame)) {
+            s->frame[s->len] = b;
+        }
+        s->len++;
+
+        if (s->expected && s->len == s->expected) {
+            if (s->expected >= 6) {
+                uint8_t checksum = 0;
+                for (size_t j = 3; j + 1 < s->expected; j++) {
+                    checksum ^= s->frame[j];
+                }
+                uint8_t expected_checksum = s->frame[s->expected - 1];
+                if (checksum == expected_checksum) {
+                    m->msp_frames[src]++;
+                } else {
+                    m->msp_invalid[src]++;
+                }
+            } else {
+                m->msp_invalid[src]++;
+            }
+            msp_stream_reset(s);
+        } else if (s->expected && s->len > s->expected) {
+            m->msp_invalid[src]++;
+            msp_stream_reset(s);
+        } else if (s->len >= sizeof(s->frame)) {
+            m->msp_invalid[src]++;
+            msp_stream_reset(s);
+        }
+    }
+}
+
+static void mav_stream_reset(mav_stream_t *s)
+{
+    s->len = 0;
+    s->expected = 0;
+    s->v2 = false;
+}
+
+static size_t mav_stream_expected(const mav_stream_t *s)
+{
+    if ( s->len < 2) return 0;
+    size_t payload_len = s->frame[1];
+    if (s->v2) {
+        if (s->len < 3) return 0;
+        uint8_t incompat = s->frame[2];
+        size_t signature = (incompat & 0x01U) ? 13U : 0U;
+        return 10 + payload_len + 2 + signature;
+    }
+
+    return 6 + payload_len + 2;
+}
+
+static void telemetry_monitor_feed_mav(telemetry_monitor_t *m, crsf_source_t src,
+                                       const uint8_t *data, size_t n)
+{
+    mav_stream_t *s = &m->mav_streams[src];
+
+    for (size_t i = 0; i < n; i++) {
+        uint8_t b = data[i];
+
+        if (s->len == 0) {
+            if (b == 0xFE || b == 0xFD) {
+                s->frame[0] = b;
+                s->len = 1;
+                s->v2 = (b == 0xFD);
+            }
+            continue;
+        }
+
+        if (s->len < sizeof(s->frame)) {
+            s->frame[s->len] = b;
+        }
+        s->len++;
+
+        if (s->len == 2 || (s->v2 && s->len == 3)) {
+            s->expected = mav_stream_expected(s);
+            if (!s->expected || s->expected > sizeof(s->frame)) {
+                m->mav_invalid[src]++;
+                mav_stream_reset(s);
+            }
+            continue;
+        }
+
+        if (s->expected && s->len == s->expected) {
+            m->mav_frames[src]++;
+            mav_stream_reset(s);
+        } else if (s->expected && s->len > s->expected) {
+            m->mav_invalid[src]++;
+            mav_stream_reset(s);
+        } else if (s->len >= sizeof(s->frame)) {
+            m->mav_invalid[src]++;
+            mav_stream_reset(s);
+        }
+    }
+}
+
+static void telemetry_monitor_feed(telemetry_monitor_t *m, crsf_source_t src,
+                                   const uint8_t *data, size_t n)
+{
+    if (!m->enabled) return;
+
+    const char *src_name = (src == CRSF_FROM_UART) ? "uart" : "udp";
+    telemetry_proto_t proto = m->protocol[src];
+
+    if (proto == TELEMETRY_PROTO_UNKNOWN) {
+        telemetry_proto_t detected = TELEMETRY_PROTO_UNKNOWN;
+
+        uint8_t prev2 = 0, prev1 = 0;
+        if (m->detect_tail_len[src] == 1) {
+            prev1 = m->detect_tail[src][0];
+        } else if (m->detect_tail_len[src] >= 2) {
+            prev2 = m->detect_tail[src][0];
+            prev1 = m->detect_tail[src][1];
+        }
+
+        for (size_t i = 0; i < n && detected == TELEMETRY_PROTO_UNKNOWN; i++) {
+            uint8_t b = data[i];
+            uint8_t next = (i + 1 < n) ? data[i + 1] : 0;
+            uint8_t next2 = (i + 2 < n) ? data[i + 2] : 0;
+
+            if ((prev2 == '$' && prev1 == 'M' && (b == '<' || b == '>')) ||
+                (prev1 == '$' && b == 'M' && (next == '<' || next == '>')) ||
+                (b == '$' && next == 'M' && (next2 == '<' || next2 == '>'))){
+                detected = TELEMETRY_PROTO_MSP;
+                break;
+            }
+
+            if (b == 0xFE || b == 0xFD) {
+                if (i + 1 < n) {
+                    size_t payload_len = next;
+                    size_t expected = (b == 0xFD)
+                        ? (10U + payload_len + 2U + ((i + 2 < n && (next2 & 0x01U)) ? 13U : 0U))
+                        : (6U + payload_len + 2U);
+                    if (expected >= 8 && expected <= sizeof(m->mav_streams[src].frame)) {
+                        detected = TELEMETRY_PROTO_MAV;
+                        break;
+                    }
+                }
+            }
+
+            if (i + 1 < n) {
+                uint8_t len = next;
+                if (len >= 2 && len <= 64) {
+                    detected = TELEMETRY_PROTO_CRSF;
+                }
+            }
+
+            prev2 = prev1;
+            prev1 = b;
+        }
+
+        if (n >= 2) {
+            m->detect_tail[src][0] = data[n - 2];
+            m->detect_tail[src][1] = data[n - 1];
+            m->detect_tail_len[src] = 2;
+        } else if (n == 1) {
+            if (m->detect_tail_len[src] > 0) {
+                m->detect_tail[src][0] = m->detect_tail[src][m->detect_tail_len[src] - 1];
+                m->detect_tail[src][1] = data[0];
+                m->detect_tail_len[src] = 2;
+            } else {
+                m->detect_tail[src][0] = data[0];
+                m->detect_tail_len[src] = 1;
+            }
+        }
+
+        m->undecided_bytes[src] += n;
+        if (detected == TELEMETRY_PROTO_UNKNOWN && m->undecided_bytes[src] > 4096) {
+            detected = TELEMETRY_PROTO_CRSF;
+        }
+
+        if (detected != TELEMETRY_PROTO_UNKNOWN) {
+            m->protocol[src] = detected;
+            m->undecided_bytes[src] = 0;
+            const char *proto_name =
+                (detected == TELEMETRY_PROTO_CRSF) ? "crsf" :
+                (detected == TELEMETRY_PROTO_MSP)  ? "msp"  : "mavlink";
+            vlog(2, "telemetry: locked %s parser for %s", proto_name, src_name);
+        }
+
+        proto = m->protocol[src];
+    }
+
+    if (proto == TELEMETRY_PROTO_MSP) {
+        telemetry_monitor_feed_msp(m, src, data, n);
+    } else if (proto == TELEMETRY_PROTO_MAV) {
+        telemetry_monitor_feed_mav(m, src, data, n);
+    } else {
+        crsf_monitor_feed(&m->crsf, src, data, n);
+    }
+}
+
+static void telemetry_monitor_maybe_report(telemetry_monitor_t *m)
+{
+    if (!m->enabled || !g_verbosity) return;
+
+    crsf_monitor_maybe_report(&m->crsf);
+
+    struct timespec now;
+    get_mono(&now);
+    if (m->last_report.tv_sec == 0 && m->last_report.tv_nsec == 0) {
+        m->last_report = now;
+        return;
+    }
+
+    long long elapsed_ms = diff_ms(&now, &m->last_report);
+    if (elapsed_ms < 1000) return;
+
+    fprintf(stderr,
+            "[telemetry] msp uart=%llu udp=%llu inv=%llu\n"
+            "            mav uart=%llu udp=%llu inv=%llu\n",
+            (unsigned long long)m->msp_frames[CRSF_FROM_UART],
+            (unsigned long long)m->msp_frames[CRSF_FROM_UDP],
+            (unsigned long long)(m->msp_invalid[CRSF_FROM_UART] +
+                                 m->msp_invalid[CRSF_FROM_UDP]),
+            (unsigned long long)m->mav_frames[CRSF_FROM_UART],
+            (unsigned long long)m->mav_frames[CRSF_FROM_UDP],
+            (unsigned long long)(m->mav_invalid[CRSF_FROM_UART] +
+                                 m->mav_invalid[CRSF_FROM_UDP]));
+
+    m->last_report = now;
+    memset(m->msp_frames, 0, sizeof(m->msp_frames));
+    memset(m->msp_invalid, 0, sizeof(m->msp_invalid));
+    memset(m->mav_frames, 0, sizeof(m->mav_frames));
+    memset(m->mav_invalid, 0, sizeof(m->mav_invalid));
+}
+
 /* CRSF logging */
 static void crsf_log_reset(crsf_log_state_t *log)
 {
@@ -763,7 +1100,7 @@ static void crsf_log_reset(crsf_log_state_t *log)
 
 static void crsf_log_apply_config(crsf_log_state_t *log, const config_t *cfg)
 {
-    bool new_enabled = cfg->crsf_detect && cfg->crsf_log && cfg->crsf_log_path[0];
+    bool new_enabled = cfg->telemetry_detect && cfg->crsf_log && cfg->crsf_log_path[0];
 
     if (!new_enabled) {
         crsf_log_reset(log);
@@ -1008,8 +1345,8 @@ int main(int argc, char **argv){
     vlog(1, "Loaded config: uart_backend=%s",
          (cfg.uart_backend==UART_TTY?"tty":"stdio"));
 
-    crsf_monitor_t crsf;
-    crsf_monitor_init(&crsf, cfg.crsf_detect && g_verbosity);
+    telemetry_monitor_t telemetry;
+    telemetry_monitor_init(&telemetry, cfg.telemetry_detect && g_verbosity);
 
     state_t st; memset(&st,0,sizeof(st));
     st.fd_uart=st.fd_net=-1; st.fd_stdout=-1;
@@ -1104,7 +1441,7 @@ int main(int argc, char **argv){
 
                 cfg = newcfg;
 
-                crsf_monitor_set_enabled(&crsf, cfg.crsf_detect && g_verbosity);
+                telemetry_monitor_set_enabled(&telemetry, cfg.telemetry_detect && g_verbosity);
                 crsf_log_apply_config(&st.crsf_log, &cfg);
 
                 if(rx_resize){
@@ -1189,14 +1526,20 @@ int main(int argc, char **argv){
             if(fd==st.fd_uart && (ev&EPOLLIN)){
                 ssize_t r=read(st.fd_uart,(void*)buf_uart,cfg.rx_buf);
                 if(r>0){
-                    bool crsf_mode = cfg.crsf_detect != 0;
+                    bool telemetry_mode = cfg.telemetry_detect != 0;
 
                     get_mono(&st.last_uart_rx);
-                    if (crsf.enabled) {
-                        crsf_monitor_feed(&crsf, CRSF_FROM_UART, buf_uart, (size_t)r);
+                    if (telemetry.enabled) {
+                        telemetry_monitor_feed(&telemetry, CRSF_FROM_UART, buf_uart, (size_t)r);
                     }
 
-                    if (crsf_mode) {
+                    telemetry_proto_t uart_proto = telemetry.enabled
+                        ? telemetry.protocol[CRSF_FROM_UART]
+                        : TELEMETRY_PROTO_CRSF;
+                    bool use_crsf_forward = telemetry_mode &&
+                        (!telemetry.enabled || uart_proto == TELEMETRY_PROTO_CRSF);
+
+                    if (use_crsf_forward) {
                         crsf_forward_feed(&cfg, &st, buf_uart, (size_t)r);
                     } else {
                         uart_forward_with_coalesce(&cfg, &st, buf_uart, (size_t)r);
@@ -1208,8 +1551,8 @@ int main(int argc, char **argv){
                 struct sockaddr_in from; socklen_t flen=sizeof(from);
                 ssize_t r=recvfrom(st.fd_net, buf_net, cfg.rx_buf, 0,(struct sockaddr*)&from,&flen);
                 if(r>0){
-                    if (crsf.enabled) {
-                        crsf_monitor_feed(&crsf, CRSF_FROM_UDP, buf_net, (size_t)r);
+                    if (telemetry.enabled) {
+                        telemetry_monitor_feed(&telemetry, CRSF_FROM_UDP, buf_net, (size_t)r);
                     }
                     if(!cfg.udp_peer_addr[0]){
                         bool changed = !st.udp_peer_set ||
@@ -1266,11 +1609,11 @@ int main(int argc, char **argv){
         udp_flush_if_ready(&cfg,&st,false,
             st.udp_out_len >= (size_t)cfg.udp_coalesce_bytes ? "size_threshold" : "pending");
         maybe_print_stats(&st);
-        crsf_monitor_maybe_report(&crsf);
+        telemetry_monitor_maybe_report(&telemetry);
     }
 
     maybe_print_stats(&st);
-    crsf_monitor_maybe_report(&crsf);
+    telemetry_monitor_maybe_report(&telemetry);
     vlog(1, "Exiting");
 
     if(cfg.uart_backend==UART_TTY && st.fd_uart>=0) del_ep(st.epfd,st.fd_uart), close_fd(&st.fd_uart);
