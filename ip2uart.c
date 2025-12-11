@@ -165,9 +165,22 @@ typedef struct { uint8_t frame[300]; size_t len; size_t expected; } msp_stream_t
 
 typedef struct { uint8_t frame[300]; size_t len; size_t expected; bool v2; } mav_stream_t;
 
+typedef enum {
+    TELEMETRY_PROTO_UNKNOWN = 0,
+    TELEMETRY_PROTO_CRSF,
+    TELEMETRY_PROTO_MSP,
+    TELEMETRY_PROTO_MAV
+} telemetry_proto_t;
+
 typedef struct {
     bool enabled;
     crsf_monitor_t crsf;
+
+    telemetry_proto_t protocol[CRSF_SRC_MAX];
+
+    uint8_t detect_tail[CRSF_SRC_MAX][2];
+    size_t detect_tail_len[CRSF_SRC_MAX];
+    size_t undecided_bytes[CRSF_SRC_MAX];
 
     msp_stream_t msp_streams[CRSF_SRC_MAX];
     uint64_t msp_frames[CRSF_SRC_MAX];
@@ -953,9 +966,95 @@ static void telemetry_monitor_feed(telemetry_monitor_t *m, crsf_source_t src,
 {
     if (!m->enabled) return;
 
-    crsf_monitor_feed(&m->crsf, src, data, n);
-    telemetry_monitor_feed_msp(m, src, data, n);
-    telemetry_monitor_feed_mav(m, src, data, n);
+    const char *src_name = (src == CRSF_FROM_UART) ? "uart" : "udp";
+    telemetry_proto_t proto = m->protocol[src];
+
+    if (proto == TELEMETRY_PROTO_UNKNOWN) {
+        telemetry_proto_t detected = TELEMETRY_PROTO_UNKNOWN;
+
+        uint8_t prev2 = 0, prev1 = 0;
+        if (m->detect_tail_len[src] == 1) {
+            prev1 = m->detect_tail[src][0];
+        } else if (m->detect_tail_len[src] >= 2) {
+            prev2 = m->detect_tail[src][0];
+            prev1 = m->detect_tail[src][1];
+        }
+
+        for (size_t i = 0; i < n && detected == TELEMETRY_PROTO_UNKNOWN; i++) {
+            uint8_t b = data[i];
+            uint8_t next = (i + 1 < n) ? data[i + 1] : 0;
+            uint8_t next2 = (i + 2 < n) ? data[i + 2] : 0;
+
+            if ((prev2 == '$' && prev1 == 'M' && (b == '<' || b == '>')) ||
+                (prev1 == '$' && b == 'M' && (next == '<' || next == '>')) ||
+                (b == '$' && next == 'M' && (next2 == '<' || next2 == '>'))){
+                detected = TELEMETRY_PROTO_MSP;
+                break;
+            }
+
+            if (b == 0xFE || b == 0xFD) {
+                if (i + 1 < n) {
+                    size_t payload_len = next;
+                    size_t expected = (b == 0xFD)
+                        ? (10U + payload_len + 2U + ((i + 2 < n && (next2 & 0x01U)) ? 13U : 0U))
+                        : (6U + payload_len + 2U);
+                    if (expected >= 8 && expected <= sizeof(m->mav_streams[src].frame)) {
+                        detected = TELEMETRY_PROTO_MAV;
+                        break;
+                    }
+                }
+            }
+
+            if (i + 1 < n) {
+                uint8_t len = next;
+                if (len >= 2 && len <= 64) {
+                    detected = TELEMETRY_PROTO_CRSF;
+                }
+            }
+
+            prev2 = prev1;
+            prev1 = b;
+        }
+
+        if (n >= 2) {
+            m->detect_tail[src][0] = data[n - 2];
+            m->detect_tail[src][1] = data[n - 1];
+            m->detect_tail_len[src] = 2;
+        } else if (n == 1) {
+            if (m->detect_tail_len[src] > 0) {
+                m->detect_tail[src][0] = m->detect_tail[src][m->detect_tail_len[src] - 1];
+                m->detect_tail[src][1] = data[0];
+                m->detect_tail_len[src] = 2;
+            } else {
+                m->detect_tail[src][0] = data[0];
+                m->detect_tail_len[src] = 1;
+            }
+        }
+
+        m->undecided_bytes[src] += n;
+        if (detected == TELEMETRY_PROTO_UNKNOWN && m->undecided_bytes[src] > 4096) {
+            detected = TELEMETRY_PROTO_CRSF;
+        }
+
+        if (detected != TELEMETRY_PROTO_UNKNOWN) {
+            m->protocol[src] = detected;
+            m->undecided_bytes[src] = 0;
+            const char *proto_name =
+                (detected == TELEMETRY_PROTO_CRSF) ? "crsf" :
+                (detected == TELEMETRY_PROTO_MSP)  ? "msp"  : "mavlink";
+            vlog(2, "telemetry: locked %s parser for %s", proto_name, src_name);
+        }
+
+        proto = m->protocol[src];
+    }
+
+    if (proto == TELEMETRY_PROTO_MSP) {
+        telemetry_monitor_feed_msp(m, src, data, n);
+    } else if (proto == TELEMETRY_PROTO_MAV) {
+        telemetry_monitor_feed_mav(m, src, data, n);
+    } else {
+        crsf_monitor_feed(&m->crsf, src, data, n);
+    }
 }
 
 static void telemetry_monitor_maybe_report(telemetry_monitor_t *m)
