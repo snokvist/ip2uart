@@ -55,3 +55,6 @@ An example configuration is shipped as `ip2uart.conf`.
 - Use `-v` one or more times to print one-line transfer statistics each second.
 - When `telemetry_detect` is enabled, verbose mode reports per-type CRSF counters plus MSP and
   MAVLink frame counts for UART and UDP flows.
+- Telemetry detection is per direction; once CRSF, MSP, or MAVLink is recognized, that parser is
+  reused for the source while raw forwarding continues for other protocols so mixed telemetry can
+  flow without disruption.
