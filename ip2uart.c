@@ -5,7 +5,12 @@
 // - Short-write safe: ring buffers for both directions (non-blocking)
 // - SIGHUP: reload /etc/ip2uart.conf and reopen resources
 // - Verbose logging: -v prints one-line stats once per second
-// SPDX-License-Identifier: MIT
+// autod – Autod Personal Use License
+// Copyright (c) 2025 Joakim Snökvist
+// Licensed for personal, non-commercial use only.
+// Redistribution or commercial use requires prior written approval from Joakim Snökvist.
+// See LICENSE.md for full terms.
+//
 
 #define _GNU_SOURCE
 #include <arpa/inet.h>
