@@ -131,6 +131,10 @@ typedef struct {
 /* ------------------------------ CRSF monitor ------------------------------- */
 typedef enum { CRSF_FROM_UART = 0, CRSF_FROM_UDP = 1, CRSF_SRC_MAX = 2 } crsf_source_t;
 
+typedef void (*crsf_frame_handler_t)(crsf_source_t src, uint8_t type,
+                                     const uint8_t *payload, size_t payload_len,
+                                     void *user);
+
 typedef struct {
     uint8_t frame[256];
     size_t len;
@@ -145,13 +149,13 @@ typedef struct {
     uint64_t type_counts[CRSF_SRC_MAX][256];
     uint64_t invalid_frames[CRSF_SRC_MAX];
     struct timespec last_report;
+    crsf_frame_handler_t on_frame;
+    void *on_frame_user;
 } crsf_monitor_t;
 
 typedef struct {
-    bool enabled;
     bool has_battery;
     bool has_gps;
-    struct timespec last_write;
 
     double voltage_v;
     double current_raw;
@@ -164,6 +168,12 @@ typedef struct {
     double heading_deg;
     double altitude_m;
     uint8_t sats;
+} crsf_log_entry_t;
+
+typedef struct {
+    bool enabled;
+    struct timespec last_write;
+    crsf_log_entry_t entries[CRSF_SRC_MAX];
 } crsf_log_state_t;
 
 typedef struct { uint8_t frame[300]; size_t len; size_t expected; } msp_stream_t;
@@ -180,6 +190,8 @@ typedef enum {
 typedef struct {
     bool enabled;
     crsf_monitor_t crsf;
+    crsf_frame_handler_t crsf_cb;
+    void *crsf_cb_user;
 
     telemetry_proto_t protocol[CRSF_SRC_MAX];
 
@@ -584,10 +596,13 @@ static void maybe_print_stats(state_t *st){
 
 /* ------------------------------ CRSF support -------------------------------- */
 /* CRSF monitor */
-static void crsf_monitor_init(crsf_monitor_t *m, bool enabled)
+static void crsf_monitor_init(crsf_monitor_t *m, bool enabled,
+                              crsf_frame_handler_t on_frame, void *user)
 {
     memset(m, 0, sizeof(*m));
     m->enabled = enabled;
+    m->on_frame = on_frame;
+    m->on_frame_user = user;
 
     static const uint8_t known_types[] = {
         0x02, /* GPS */
@@ -626,7 +641,9 @@ static void crsf_monitor_init(crsf_monitor_t *m, bool enabled)
 static void crsf_monitor_set_enabled(crsf_monitor_t *m, bool enabled)
 {
     if (m->enabled == enabled) return;
-    crsf_monitor_init(m, enabled);
+    crsf_frame_handler_t cb = m->on_frame;
+    void *user = m->on_frame_user;
+    crsf_monitor_init(m, enabled, cb, user);
 }
 
 static void crsf_stream_reset(crsf_stream_t *s)
@@ -646,6 +663,7 @@ static void crsf_monitor_handle_frame(crsf_monitor_t *m, crsf_source_t src, crsf
         return;
     }
 
+    size_t payload_len = (size_t)len_field >= 2 ? (size_t)len_field - 2 : 0;
     size_t crc_off = total - 1;
     uint8_t expected_crc = s->frame[crc_off];
     uint8_t calc_crc = crc8_d5(s->frame + 2, (size_t)len_field - 1);
@@ -656,6 +674,10 @@ static void crsf_monitor_handle_frame(crsf_monitor_t *m, crsf_source_t src, crsf
 
     uint8_t type = s->frame[2];
     m->type_counts[src][type] += 1;
+    if (m->on_frame) {
+        const uint8_t *payload = s->frame + 3;
+        m->on_frame(src, type, payload, payload_len, m->on_frame_user);
+    }
 
     if (!m->recognized_types[type] && !m->unknown_reported[type]) {
         vlog(1, "CRSF: unrecognized frame type 0x%02X (len=%zu)", type, s->len);
@@ -793,17 +815,23 @@ static void crsf_monitor_maybe_report(crsf_monitor_t *m)
 }
 
 /* Telemetry monitor wrapper */
-static void telemetry_monitor_init(telemetry_monitor_t *m, bool enabled)
+static void telemetry_monitor_init(telemetry_monitor_t *m, bool enabled,
+                                   crsf_frame_handler_t crsf_cb,
+                                   void *crsf_cb_user)
 {
     memset(m, 0, sizeof(*m));
     m->enabled = enabled;
-    crsf_monitor_init(&m->crsf, enabled);
+    m->crsf_cb = crsf_cb;
+    m->crsf_cb_user = crsf_cb_user;
+    crsf_monitor_init(&m->crsf, enabled, crsf_cb, crsf_cb_user);
 }
 
 static void telemetry_monitor_set_enabled(telemetry_monitor_t *m, bool enabled)
 {
     if (m->enabled == enabled) return;
-    telemetry_monitor_init(m, enabled);
+    crsf_frame_handler_t cb = m->crsf_cb;
+    void *user = m->crsf_cb_user;
+    telemetry_monitor_init(m, enabled, cb, user);
 }
 
 static void msp_stream_reset(msp_stream_t *s)
@@ -1098,6 +1126,23 @@ static void telemetry_monitor_maybe_report(telemetry_monitor_t *m)
 }
 
 /* CRSF logging */
+typedef struct {
+    const config_t *cfg;
+    crsf_log_state_t *log;
+} crsf_log_context_t;
+
+static void crsf_log_update(const config_t *cfg, crsf_log_state_t *log, crsf_source_t src,
+                            uint8_t type, const uint8_t *payload, size_t payload_len);
+
+static void crsf_log_on_frame(crsf_source_t src, uint8_t type, const uint8_t *payload,
+                              size_t payload_len, void *user)
+{
+    crsf_log_context_t *ctx = (crsf_log_context_t *)user;
+    if (!ctx || !ctx->cfg || !ctx->log) return;
+
+    crsf_log_update(ctx->cfg, ctx->log, src, type, payload, payload_len);
+}
+
 static void crsf_log_reset(crsf_log_state_t *log)
 {
     memset(log, 0, sizeof(*log));
@@ -1113,8 +1158,6 @@ static void crsf_log_apply_config(crsf_log_state_t *log, const config_t *cfg)
     }
 
     if (!log->enabled) {
-        log->has_battery = false;
-        log->has_gps = false;
         log->last_write.tv_sec = 0;
         log->last_write.tv_nsec = 0;
     }
@@ -1122,10 +1165,26 @@ static void crsf_log_apply_config(crsf_log_state_t *log, const config_t *cfg)
     log->enabled = true;
 }
 
+static bool crsf_log_has_data(const crsf_log_state_t *log)
+{
+    for (int i = 0; i < CRSF_SRC_MAX; i++) {
+        if (log->entries[i].has_battery || log->entries[i].has_gps) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static const char *crsf_log_prefix(crsf_source_t src)
+{
+    return (src == CRSF_FROM_UART) ? "" : "udp_";
+}
+
 static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log)
 {
     if (!log->enabled) return;
-    if (!log->has_battery && !log->has_gps) return;
+    if (!crsf_log_has_data(log)) return;
 
     struct timespec now;
     get_mono(&now);
@@ -1139,41 +1198,50 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log)
         return;
     }
 
-    if (log->has_battery) {
-        fprintf(f, "voltage=%.1f\n", log->voltage_v);
-        fprintf(f, "current=%.0f\n", log->current_raw);
-        fprintf(f, "capacity=%u\n", log->capacity_mah);
-        fprintf(f, "remaining=%u\n", (unsigned)log->remaining_pct);
-    }
+    for (int i = 0; i < CRSF_SRC_MAX; i++) {
+        const crsf_log_entry_t *entry = &log->entries[i];
+        if (!entry->has_battery && !entry->has_gps) continue;
 
-    if (log->has_gps) {
-        fprintf(f, "latitude=%.7f\n", log->latitude_deg);
-        fprintf(f, "longitude=%.7f\n", log->longitude_deg);
-        fprintf(f, "groundspeed=%.0f\n", log->groundspeed_raw);
-        fprintf(f, "heading=%.2f\n", log->heading_deg);
-        fprintf(f, "altitude=%.2f\n", log->altitude_m);
-        fprintf(f, "sats=%u\n", (unsigned)log->sats);
+        const char *prefix = crsf_log_prefix((crsf_source_t)i);
+
+        if (entry->has_battery) {
+            fprintf(f, "%svoltage=%.1f\n", prefix, entry->voltage_v);
+            fprintf(f, "%scurrent=%.0f\n", prefix, entry->current_raw);
+            fprintf(f, "%scapacity=%u\n", prefix, entry->capacity_mah);
+            fprintf(f, "%sremaining=%u\n", prefix, (unsigned)entry->remaining_pct);
+        }
+
+        if (entry->has_gps) {
+            fprintf(f, "%slatitude=%.7f\n", prefix, entry->latitude_deg);
+            fprintf(f, "%slongitude=%.7f\n", prefix, entry->longitude_deg);
+            fprintf(f, "%sgroundspeed=%.0f\n", prefix, entry->groundspeed_raw);
+            fprintf(f, "%sheading=%.2f\n", prefix, entry->heading_deg);
+            fprintf(f, "%saltitude=%.2f\n", prefix, entry->altitude_m);
+            fprintf(f, "%ssats=%u\n", prefix, (unsigned)entry->sats);
+        }
     }
 
     fclose(f);
     log->last_write = now;
 }
 
-static void crsf_log_update(const config_t *cfg, state_t *st, uint8_t type, const uint8_t *payload, size_t payload_len)
+static void crsf_log_update(const config_t *cfg, crsf_log_state_t *log, crsf_source_t src,
+                            uint8_t type, const uint8_t *payload, size_t payload_len)
 {
-    if (!st->crsf_log.enabled) return;
+    if (!log->enabled || src >= CRSF_SRC_MAX) return;
 
+    crsf_log_entry_t *entry = &log->entries[src];
     if (type == 0x08 && payload_len >= 8) {
         uint16_t voltage_raw = ((uint16_t)payload[0] << 8) | (uint16_t)payload[1];
         uint16_t current_raw = ((uint16_t)payload[2] << 8) | (uint16_t)payload[3];
         uint32_t capacity = ((uint32_t)payload[4] << 16) | ((uint32_t)payload[5] << 8) | (uint32_t)payload[6];
         uint8_t remaining = payload[7];
 
-        st->crsf_log.voltage_v = (double)voltage_raw / 10.0;
-        st->crsf_log.current_raw = (double)current_raw;
-        st->crsf_log.capacity_mah = capacity;
-        st->crsf_log.remaining_pct = remaining;
-        st->crsf_log.has_battery = true;
+        entry->voltage_v = (double)voltage_raw / 10.0;
+        entry->current_raw = (double)current_raw;
+        entry->capacity_mah = capacity;
+        entry->remaining_pct = remaining;
+        entry->has_battery = true;
     } else if (type == 0x02 && payload_len >= 15) {
         int32_t lat_raw = (int32_t)((uint32_t)payload[0] << 24 | (uint32_t)payload[1] << 16 |
                                     (uint32_t)payload[2] << 8 | (uint32_t)payload[3]);
@@ -1184,18 +1252,18 @@ static void crsf_log_update(const config_t *cfg, state_t *st, uint8_t type, cons
         uint16_t altitude = ((uint16_t)payload[12] << 8) | (uint16_t)payload[13];
         uint8_t sats = payload[14];
 
-        st->crsf_log.latitude_deg = (double)lat_raw / 1e7;
-        st->crsf_log.longitude_deg = (double)lon_raw / 1e7;
-        st->crsf_log.groundspeed_raw = (double)groundspeed;
-        st->crsf_log.heading_deg = (double)heading / 100.0;
-        st->crsf_log.altitude_m = (double)((int)altitude - 1000);
-        st->crsf_log.sats = sats;
-        st->crsf_log.has_gps = true;
+        entry->latitude_deg = (double)lat_raw / 1e7;
+        entry->longitude_deg = (double)lon_raw / 1e7;
+        entry->groundspeed_raw = (double)groundspeed;
+        entry->heading_deg = (double)heading / 100.0;
+        entry->altitude_m = (double)((int)altitude - 1000);
+        entry->sats = sats;
+        entry->has_gps = true;
     } else {
         return;
     }
 
-    crsf_log_maybe_write(cfg, &st->crsf_log);
+    crsf_log_maybe_write(cfg, log);
 }
 
 /* CRSF forwarding */
@@ -1208,7 +1276,6 @@ static void crsf_forward_send(const config_t *cfg, state_t *st, const crsf_strea
 {
     uint8_t len_field = s->frame[1];
     size_t total = (size_t)len_field + 2;
-    size_t payload_len = (size_t)len_field >= 2 ? (size_t)len_field - 2 : 0;
 
     if (len_field < 2 || total != s->len || total < 4 || total > sizeof(s->frame)) {
         st->drops_uart_to_net += (uint64_t)s->len;
@@ -1224,8 +1291,6 @@ static void crsf_forward_send(const config_t *cfg, state_t *st, const crsf_strea
         vlog(2, "CRSF: CRC mismatch calc=0x%02X expected=0x%02X, dropping", calc_crc, expected_crc);
         return;
     }
-
-    crsf_log_update(cfg, st, s->frame[2], s->frame + 3, payload_len);
 
     if (!st->udp_peer_set) {
         st->drops_uart_to_net += (uint64_t)s->len;
@@ -1350,14 +1415,16 @@ int main(int argc, char **argv){
     vlog(1, "Loaded config: uart_backend=%s",
          (cfg.uart_backend==UART_TTY?"tty":"stdio"));
 
-    telemetry_monitor_t telemetry;
-    telemetry_monitor_init(&telemetry, cfg.telemetry_detect && g_verbosity);
-
     state_t st; memset(&st,0,sizeof(st));
     st.fd_uart=st.fd_net=-1; st.fd_stdout=-1;
     st.epfd=epoll_create1(0); if(st.epfd<0){ perror("epoll_create1"); return 1; }
 
     crsf_log_apply_config(&st.crsf_log, &cfg);
+
+    crsf_log_context_t log_ctx = { .cfg = &cfg, .log = &st.crsf_log };
+    bool telemetry_enabled = cfg.telemetry_detect && (g_verbosity || cfg.crsf_log);
+    telemetry_monitor_t telemetry;
+    telemetry_monitor_init(&telemetry, telemetry_enabled, crsf_log_on_frame, &log_ctx);
 
     size_t udp_out_cap = cfg.udp_max_datagram>0?(size_t)cfg.udp_max_datagram:1200;
     st.udp_out=(uint8_t*)malloc(udp_out_cap);
@@ -1446,7 +1513,8 @@ int main(int argc, char **argv){
 
                 cfg = newcfg;
 
-                telemetry_monitor_set_enabled(&telemetry, cfg.telemetry_detect && g_verbosity);
+                telemetry_monitor_set_enabled(
+                    &telemetry, cfg.telemetry_detect && (g_verbosity || cfg.crsf_log));
                 crsf_log_apply_config(&st.crsf_log, &cfg);
 
                 if(rx_resize){
