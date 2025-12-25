@@ -182,6 +182,9 @@ typedef struct {
     bool enabled;
     struct timespec last_write;
     crsf_log_entry_t entries[CRSF_SRC_MAX];
+    uint64_t last_pkts_uart_to_net;
+    uint64_t last_pkts_net_to_uart;
+    struct timespec last_rate;
 } crsf_log_state_t;
 
 typedef struct { uint8_t frame[300]; size_t len; size_t expected; } msp_stream_t;
@@ -1137,18 +1140,20 @@ static void telemetry_monitor_maybe_report(telemetry_monitor_t *m)
 typedef struct {
     const config_t *cfg;
     crsf_log_state_t *log;
+    const state_t *st;
 } crsf_log_context_t;
 
-static void crsf_log_update(const config_t *cfg, crsf_log_state_t *log, crsf_source_t src,
-                            uint8_t type, const uint8_t *payload, size_t payload_len);
+static void crsf_log_update(const config_t *cfg, crsf_log_state_t *log, const state_t *st,
+                            crsf_source_t src, uint8_t type, const uint8_t *payload,
+                            size_t payload_len);
 
 static void crsf_log_on_frame(crsf_source_t src, uint8_t type, const uint8_t *payload,
                               size_t payload_len, void *user)
 {
     crsf_log_context_t *ctx = (crsf_log_context_t *)user;
-    if (!ctx || !ctx->cfg || !ctx->log) return;
+    if (!ctx || !ctx->cfg || !ctx->log || !ctx->st) return;
 
-    crsf_log_update(ctx->cfg, ctx->log, src, type, payload, payload_len);
+    crsf_log_update(ctx->cfg, ctx->log, ctx->st, src, type, payload, payload_len);
 }
 
 static void crsf_log_reset(crsf_log_state_t *log)
@@ -1173,27 +1178,15 @@ static void crsf_log_apply_config(crsf_log_state_t *log, const config_t *cfg)
     log->enabled = true;
 }
 
-static bool crsf_log_has_data(const crsf_log_state_t *log)
-{
-    for (int i = 0; i < CRSF_SRC_MAX; i++) {
-        const crsf_log_entry_t *e = &log->entries[i];
-        if (e->has_battery || e->has_gps || e->has_any) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
 static const char *crsf_log_prefix(crsf_source_t src)
 {
     return (src == CRSF_FROM_UART) ? "" : "udp_";
 }
 
-static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log)
+static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
+                                 const state_t *st)
 {
-    if (!log->enabled) return;
-    if (!crsf_log_has_data(log)) return;
+    if (!log->enabled || !st) return;
 
     struct timespec now;
     get_mono(&now);
@@ -1206,6 +1199,29 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log)
         vlog(2, "CRSF log: failed to open %s (%s)", cfg->crsf_log_path, strerror(errno));
         return;
     }
+
+    long long elapsed_ms = 0;
+    if (log->last_rate.tv_sec || log->last_rate.tv_nsec) {
+        elapsed_ms = diff_ms(&now, &log->last_rate);
+    }
+    if (elapsed_ms <= 0) {
+        log->last_pkts_uart_to_net = st->pkts_uart_to_net;
+        log->last_pkts_net_to_uart = st->pkts_net_to_uart;
+        log->last_rate = now;
+        elapsed_ms = cfg->crsf_log_rate_ms;
+    }
+
+    uint64_t delta_tx = st->pkts_uart_to_net - log->last_pkts_uart_to_net;
+    uint64_t delta_rx = st->pkts_net_to_uart - log->last_pkts_net_to_uart;
+    double tx_pps = (double)delta_tx * 1000.0 / (double)elapsed_ms;
+    double rx_pps = (double)delta_rx * 1000.0 / (double)elapsed_ms;
+
+    fprintf(f, "tx_pps=%.1f\n", tx_pps);
+    fprintf(f, "rx_pps=%.1f\n", rx_pps);
+
+    log->last_pkts_uart_to_net = st->pkts_uart_to_net;
+    log->last_pkts_net_to_uart = st->pkts_net_to_uart;
+    log->last_rate = now;
 
     for (int i = 0; i < CRSF_SRC_MAX; i++) {
         const crsf_log_entry_t *entry = &log->entries[i];
@@ -1255,8 +1271,9 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log)
     log->last_write = now;
 }
 
-static void crsf_log_update(const config_t *cfg, crsf_log_state_t *log, crsf_source_t src,
-                            uint8_t type, const uint8_t *payload, size_t payload_len)
+static void crsf_log_update(const config_t *cfg, crsf_log_state_t *log, const state_t *st,
+                            crsf_source_t src, uint8_t type, const uint8_t *payload,
+                            size_t payload_len)
 {
     if (!log->enabled || src >= CRSF_SRC_MAX) return;
 
@@ -1302,7 +1319,7 @@ static void crsf_log_update(const config_t *cfg, crsf_log_state_t *log, crsf_sou
         entry->frames_other++;
     }
 
-    crsf_log_maybe_write(cfg, log);
+    crsf_log_maybe_write(cfg, log, st);
 }
 
 /* CRSF forwarding */
@@ -1460,7 +1477,7 @@ int main(int argc, char **argv){
 
     crsf_log_apply_config(&st.crsf_log, &cfg);
 
-    crsf_log_context_t log_ctx = { .cfg = &cfg, .log = &st.crsf_log };
+    crsf_log_context_t log_ctx = { .cfg = &cfg, .log = &st.crsf_log, .st = &st };
     bool telemetry_enabled = cfg.telemetry_detect && (g_verbosity || cfg.crsf_log);
     telemetry_monitor_t telemetry;
     telemetry_monitor_init(&telemetry, telemetry_enabled, crsf_log_on_frame, &log_ctx);
@@ -1722,6 +1739,7 @@ int main(int argc, char **argv){
             st.udp_out_len >= (size_t)cfg.udp_coalesce_bytes ? "size_threshold" : "pending");
         maybe_print_stats(&st);
         telemetry_monitor_maybe_report(&telemetry);
+        crsf_log_maybe_write(&cfg, &st.crsf_log, &st);
     }
 
     maybe_print_stats(&st);
