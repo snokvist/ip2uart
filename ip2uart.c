@@ -1215,9 +1215,13 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
     uint64_t delta_rx = st->pkts_net_to_uart - log->last_pkts_net_to_uart;
     double tx_pps = (double)delta_tx * 1000.0 / (double)elapsed_ms;
     double rx_pps = (double)delta_rx * 1000.0 / (double)elapsed_ms;
+    double tx_kpkts = (double)st->pkts_uart_to_net / 1000.0;
+    double rx_kpkts = (double)st->pkts_net_to_uart / 1000.0;
 
     fprintf(f, "tx_pps=%.1f\n", tx_pps);
     fprintf(f, "rx_pps=%.1f\n", rx_pps);
+    fprintf(f, "tx_kpkts=%.1f\n", tx_kpkts);
+    fprintf(f, "rx_kpkts=%.1f\n", rx_kpkts);
 
     log->last_pkts_uart_to_net = st->pkts_uart_to_net;
     log->last_pkts_net_to_uart = st->pkts_net_to_uart;
@@ -1225,7 +1229,6 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
 
     for (int i = 0; i < CRSF_SRC_MAX; i++) {
         const crsf_log_entry_t *entry = &log->entries[i];
-        if (!entry->has_any && !entry->has_battery && !entry->has_gps) continue;
 
         const char *prefix = crsf_log_prefix((crsf_source_t)i);
 
@@ -1234,6 +1237,11 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
             fprintf(f, "%scurrent=%.0f\n", prefix, entry->current_raw);
             fprintf(f, "%scapacity=%u\n", prefix, entry->capacity_mah);
             fprintf(f, "%sremaining=%u\n", prefix, (unsigned)entry->remaining_pct);
+        } else {
+            fprintf(f, "%svoltage=\n", prefix);
+            fprintf(f, "%scurrent=\n", prefix);
+            fprintf(f, "%scapacity=\n", prefix);
+            fprintf(f, "%sremaining=\n", prefix);
         }
 
         if (entry->has_gps) {
@@ -1243,9 +1251,17 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
             fprintf(f, "%sheading=%.2f\n", prefix, entry->heading_deg);
             fprintf(f, "%saltitude=%.2f\n", prefix, entry->altitude_m);
             fprintf(f, "%ssats=%u\n", prefix, (unsigned)entry->sats);
+        } else {
+            fprintf(f, "%slatitude=\n", prefix);
+            fprintf(f, "%slongitude=\n", prefix);
+            fprintf(f, "%sgroundspeed=\n", prefix);
+            fprintf(f, "%sheading=\n", prefix);
+            fprintf(f, "%saltitude=\n", prefix);
+            fprintf(f, "%ssats=\n", prefix);
         }
 
-        if (entry->has_any) {
+        if (entry->has_any || entry->frames_rc || entry->frames_gps ||
+            entry->frames_battery || entry->frames_link_stats || entry->frames_other) {
             fprintf(f, "%src_frames=%llu\n", prefix,
                     (unsigned long long)entry->frames_rc);
             fprintf(f, "%sgps_frames=%llu\n", prefix,
@@ -1263,6 +1279,8 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
                 long long age_ms = diff_ms(&now, &entry->last_frame);
                 if (age_ms < 0) age_ms = 0;
                 fprintf(f, "%slast_frame_age_ms=%lld\n", prefix, age_ms);
+            } else {
+                fprintf(f, "%slast_frame_age_ms=\n", prefix);
             }
         }
     }
