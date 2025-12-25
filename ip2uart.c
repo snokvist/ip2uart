@@ -156,6 +156,7 @@ typedef struct {
 typedef struct {
     bool has_battery;
     bool has_gps;
+    bool has_any;
 
     double voltage_v;
     double current_raw;
@@ -168,6 +169,13 @@ typedef struct {
     double heading_deg;
     double altitude_m;
     uint8_t sats;
+
+    uint64_t frames_rc;
+    uint64_t frames_gps;
+    uint64_t frames_battery;
+    uint64_t frames_link_stats;
+    uint64_t frames_other;
+    struct timespec last_frame;
 } crsf_log_entry_t;
 
 typedef struct {
@@ -1168,7 +1176,8 @@ static void crsf_log_apply_config(crsf_log_state_t *log, const config_t *cfg)
 static bool crsf_log_has_data(const crsf_log_state_t *log)
 {
     for (int i = 0; i < CRSF_SRC_MAX; i++) {
-        if (log->entries[i].has_battery || log->entries[i].has_gps) {
+        const crsf_log_entry_t *e = &log->entries[i];
+        if (e->has_battery || e->has_gps || e->has_any) {
             return true;
         }
     }
@@ -1219,6 +1228,27 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log)
             fprintf(f, "%saltitude=%.2f\n", prefix, entry->altitude_m);
             fprintf(f, "%ssats=%u\n", prefix, (unsigned)entry->sats);
         }
+
+        if (entry->has_any) {
+            fprintf(f, "%src_frames=%llu\n", prefix,
+                    (unsigned long long)entry->frames_rc);
+            fprintf(f, "%sgps_frames=%llu\n", prefix,
+                    (unsigned long long)entry->frames_gps);
+            fprintf(f, "%sbat_frames=%llu\n", prefix,
+                    (unsigned long long)entry->frames_battery);
+            fprintf(f, "%slnk_frames=%llu\n", prefix,
+                    (unsigned long long)entry->frames_link_stats);
+            fprintf(f, "%sother_frames=%llu\n", prefix,
+                    (unsigned long long)entry->frames_other);
+
+            if (entry->last_frame.tv_sec || entry->last_frame.tv_nsec) {
+                struct timespec now;
+                get_mono(&now);
+                long long age_ms = diff_ms(&now, &entry->last_frame);
+                if (age_ms < 0) age_ms = 0;
+                fprintf(f, "%slast_frame_age_ms=%lld\n", prefix, age_ms);
+            }
+        }
     }
 
     fclose(f);
@@ -1231,6 +1261,9 @@ static void crsf_log_update(const config_t *cfg, crsf_log_state_t *log, crsf_sou
     if (!log->enabled || src >= CRSF_SRC_MAX) return;
 
     crsf_log_entry_t *entry = &log->entries[src];
+    entry->has_any = true;
+    get_mono(&entry->last_frame);
+
     if (type == 0x08 && payload_len >= 8) {
         uint16_t voltage_raw = ((uint16_t)payload[0] << 8) | (uint16_t)payload[1];
         uint16_t current_raw = ((uint16_t)payload[2] << 8) | (uint16_t)payload[3];
@@ -1242,6 +1275,7 @@ static void crsf_log_update(const config_t *cfg, crsf_log_state_t *log, crsf_sou
         entry->capacity_mah = capacity;
         entry->remaining_pct = remaining;
         entry->has_battery = true;
+        entry->frames_battery++;
     } else if (type == 0x02 && payload_len >= 15) {
         int32_t lat_raw = (int32_t)((uint32_t)payload[0] << 24 | (uint32_t)payload[1] << 16 |
                                     (uint32_t)payload[2] << 8 | (uint32_t)payload[3]);
@@ -1259,8 +1293,13 @@ static void crsf_log_update(const config_t *cfg, crsf_log_state_t *log, crsf_sou
         entry->altitude_m = (double)((int)altitude - 1000);
         entry->sats = sats;
         entry->has_gps = true;
+        entry->frames_gps++;
+    } else if (type == 0x16) {
+        entry->frames_rc++;
+    } else if (type == 0x14) {
+        entry->frames_link_stats++;
     } else {
-        return;
+        entry->frames_other++;
     }
 
     crsf_log_maybe_write(cfg, log);
