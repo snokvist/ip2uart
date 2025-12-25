@@ -1229,8 +1229,18 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
         tx_pps_sum += log->tx_pps_hist[i];
         rx_pps_sum += log->rx_pps_hist[i];
     }
-    double tx_pps_avg = tx_pps_sum / (double)log->pps_hist_count;
-    double rx_pps_avg = rx_pps_sum / (double)log->pps_hist_count;
+    size_t recent_idx = (log->pps_hist_pos + 4) % 5;
+    double tx_recent = log->tx_pps_hist[recent_idx];
+    double rx_recent = log->rx_pps_hist[recent_idx];
+    double recent_weight = 2.0; /* bias toward the newest sample for responsiveness */
+    double tx_pps_avg = tx_pps_sum;
+    double rx_pps_avg = rx_pps_sum;
+    if (log->pps_hist_count > 0) {
+        tx_pps_avg = (tx_pps_sum - tx_recent + tx_recent * recent_weight) /
+                     (recent_weight + (double)(log->pps_hist_count - 1));
+        rx_pps_avg = (rx_pps_sum - rx_recent + rx_recent * recent_weight) /
+                     (recent_weight + (double)(log->pps_hist_count - 1));
+    }
     double tx_kpkts = (double)st->pkts_uart_to_net / 1000.0;
     double rx_kpkts = (double)st->pkts_net_to_uart / 1000.0;
 
