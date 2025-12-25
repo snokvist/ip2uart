@@ -1262,16 +1262,16 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
 
         if (entry->has_any || entry->frames_rc || entry->frames_gps ||
             entry->frames_battery || entry->frames_link_stats || entry->frames_other) {
-            fprintf(f, "%src_frames=%llu\n", prefix,
-                    (unsigned long long)entry->frames_rc);
-            fprintf(f, "%sgps_frames=%llu\n", prefix,
-                    (unsigned long long)entry->frames_gps);
-            fprintf(f, "%sbat_frames=%llu\n", prefix,
-                    (unsigned long long)entry->frames_battery);
-            fprintf(f, "%slnk_frames=%llu\n", prefix,
-                    (unsigned long long)entry->frames_link_stats);
-            fprintf(f, "%sother_frames=%llu\n", prefix,
-                    (unsigned long long)entry->frames_other);
+            double rc_kframes   = (double)entry->frames_rc / 1000.0;
+            double gps_kframes  = (double)entry->frames_gps / 1000.0;
+            double bat_kframes  = (double)entry->frames_battery / 1000.0;
+            double lnk_kframes  = (double)entry->frames_link_stats / 1000.0;
+            double oth_kframes  = (double)entry->frames_other / 1000.0;
+            fprintf(f, "%src_kframes=%.1f\n", prefix, rc_kframes);
+            fprintf(f, "%sgps_kframes=%.1f\n", prefix, gps_kframes);
+            fprintf(f, "%sbat_kframes=%.1f\n", prefix, bat_kframes);
+            fprintf(f, "%slnk_kframes=%.1f\n", prefix, lnk_kframes);
+            fprintf(f, "%sother_kframes=%.1f\n", prefix, oth_kframes);
 
             if (entry->last_frame.tv_sec || entry->last_frame.tv_nsec) {
                 struct timespec now;
