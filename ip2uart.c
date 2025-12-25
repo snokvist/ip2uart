@@ -1209,7 +1209,7 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log)
 
     for (int i = 0; i < CRSF_SRC_MAX; i++) {
         const crsf_log_entry_t *entry = &log->entries[i];
-        if (!entry->has_battery && !entry->has_gps) continue;
+        if (!entry->has_any && !entry->has_battery && !entry->has_gps) continue;
 
         const char *prefix = crsf_log_prefix((crsf_source_t)i);
 
