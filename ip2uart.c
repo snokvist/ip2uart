@@ -185,6 +185,10 @@ typedef struct {
     uint64_t last_pkts_uart_to_net;
     uint64_t last_pkts_net_to_uart;
     struct timespec last_rate;
+    double tx_pps_hist[5];
+    double rx_pps_hist[5];
+    size_t pps_hist_count;
+    size_t pps_hist_pos;
 } crsf_log_state_t;
 
 typedef struct { uint8_t frame[300]; size_t len; size_t expected; } msp_stream_t;
@@ -1215,11 +1219,23 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
     uint64_t delta_rx = st->pkts_net_to_uart - log->last_pkts_net_to_uart;
     double tx_pps = (double)delta_tx * 1000.0 / (double)elapsed_ms;
     double rx_pps = (double)delta_rx * 1000.0 / (double)elapsed_ms;
+    log->tx_pps_hist[log->pps_hist_pos] = tx_pps;
+    log->rx_pps_hist[log->pps_hist_pos] = rx_pps;
+    if (log->pps_hist_count < 5) log->pps_hist_count++;
+    log->pps_hist_pos = (log->pps_hist_pos + 1) % 5;
+
+    double tx_pps_sum = 0.0, rx_pps_sum = 0.0;
+    for (size_t i = 0; i < log->pps_hist_count; i++) {
+        tx_pps_sum += log->tx_pps_hist[i];
+        rx_pps_sum += log->rx_pps_hist[i];
+    }
+    double tx_pps_avg = tx_pps_sum / (double)log->pps_hist_count;
+    double rx_pps_avg = rx_pps_sum / (double)log->pps_hist_count;
     double tx_kpkts = (double)st->pkts_uart_to_net / 1000.0;
     double rx_kpkts = (double)st->pkts_net_to_uart / 1000.0;
 
-    fprintf(f, "tx_pps=%.1f\n", tx_pps);
-    fprintf(f, "rx_pps=%.1f\n", rx_pps);
+    fprintf(f, "tx_pps=%.1f\n", tx_pps_avg);
+    fprintf(f, "rx_pps=%.1f\n", rx_pps_avg);
     fprintf(f, "tx_kpkts=%.1f\n", tx_kpkts);
     fprintf(f, "rx_kpkts=%.1f\n", rx_kpkts);
 
