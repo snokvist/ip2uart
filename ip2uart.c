@@ -216,6 +216,7 @@ typedef struct {
 #define MSP_ANALOG           110
 #define MSP_BATTERY_STATE    130
 #define MSP_STATUS_EX        150
+#define MSP_DISPLAYPORT      182
 
 typedef void (*msp_frame_handler_t)(crsf_source_t src, uint8_t cmd,
                                     const uint8_t *payload, size_t payload_len,
@@ -234,6 +235,7 @@ typedef enum {
 
 typedef struct {
     bool enabled;
+    bool detect_displayport;
     crsf_monitor_t crsf;
     crsf_frame_handler_t crsf_cb;
     void *crsf_cb_user;
@@ -291,6 +293,7 @@ typedef struct {
 
     // timers
     struct timespec last_uart_rx; // for UDP idle
+    struct timespec last_msp_poll;
     struct timespec last_stats_report;
     uint64_t last_report_pkts_uart_to_net;
     uint64_t last_report_pkts_net_to_uart;
@@ -863,15 +866,30 @@ static void crsf_monitor_maybe_report(crsf_monitor_t *m)
     }
 }
 
+static void msp_send_query(ringbuf_t *r, uint8_t cmd)
+{
+    // MSP v1 request: $ M < 0 cmd checksum
+    uint8_t buf[6];
+    buf[0] = '$';
+    buf[1] = 'M';
+    buf[2] = '<';
+    buf[3] = 0;
+    buf[4] = cmd;
+    buf[5] = cmd; // checksum for size=0 is cmd^size = cmd^0 = cmd
+
+    ring_write(r, buf, 6);
+}
+
 static void msp_monitor_print_report(telemetry_monitor_t *m, long long elapsed_ms)
 {
     (void)elapsed_ms;
-    // status(101/150), gps(106/107), bat(110/130), att(108), alt(109), oth, unk
+    // status(101/150), gps(106/107), bat(110/130), att(108), alt(109), disp(182), oth, unk
     uint64_t status[CRSF_SRC_MAX] = {0};
     uint64_t gps[CRSF_SRC_MAX] = {0};
     uint64_t battery[CRSF_SRC_MAX] = {0};
     uint64_t att[CRSF_SRC_MAX] = {0};
     uint64_t alt[CRSF_SRC_MAX] = {0};
+    uint64_t disp[CRSF_SRC_MAX] = {0};
     uint64_t other[CRSF_SRC_MAX] = {0};
     uint64_t total[CRSF_SRC_MAX] = {0};
 
@@ -884,6 +902,7 @@ static void msp_monitor_print_report(telemetry_monitor_t *m, long long elapsed_m
             else if (i == MSP_ANALOG || i == MSP_BATTERY_STATE) battery[s] += c;
             else if (i == MSP_ATTITUDE) att[s] += c;
             else if (i == MSP_ALTITUDE) alt[s] += c;
+            else if (i == MSP_DISPLAYPORT) disp[s] += c;
             else other[s] += c;
         }
     }
@@ -896,7 +915,7 @@ static void msp_monitor_print_report(telemetry_monitor_t *m, long long elapsed_m
             int max_id = -1; uint64_t max_c = 0;
             for (int i = 0; i < 256; i++) {
                 if (i == MSP_STATUS || i == MSP_STATUS_EX || i == MSP_RAW_GPS || i == MSP_COMP_GPS ||
-                    i == MSP_ANALOG || i == MSP_BATTERY_STATE || i == MSP_ATTITUDE || i == MSP_ALTITUDE) continue;
+                    i == MSP_ANALOG || i == MSP_BATTERY_STATE || i == MSP_ATTITUDE || i == MSP_ALTITUDE || i == MSP_DISPLAYPORT) continue;
                 if (m->msp_type_counts[CRSF_FROM_UART][i] > max_c) {
                     max_c = m->msp_type_counts[CRSF_FROM_UART][i];
                     max_id = i;
@@ -906,13 +925,14 @@ static void msp_monitor_print_report(telemetry_monitor_t *m, long long elapsed_m
         }
 
         fprintf(stderr,
-            "[msp]  uart stat=%llu gps=%llu bat=%llu att=%llu alt=%llu oth=%llu%s inv=%llu tot=%llu\n"
-            "       udp  stat=%llu gps=%llu bat=%llu att=%llu alt=%llu oth=%llu inv=%llu tot=%llu\n",
+            "[msp]  uart stat=%llu gps=%llu bat=%llu att=%llu alt=%llu disp=%llu oth=%llu%s inv=%llu tot=%llu\n"
+            "       udp  stat=%llu gps=%llu bat=%llu att=%llu alt=%llu disp=%llu oth=%llu inv=%llu tot=%llu\n",
             (unsigned long long)status[CRSF_FROM_UART],
             (unsigned long long)gps[CRSF_FROM_UART],
             (unsigned long long)battery[CRSF_FROM_UART],
             (unsigned long long)att[CRSF_FROM_UART],
             (unsigned long long)alt[CRSF_FROM_UART],
+            (unsigned long long)disp[CRSF_FROM_UART],
             (unsigned long long)other[CRSF_FROM_UART],
             oth_detail,
             (unsigned long long)m->msp_invalid[CRSF_FROM_UART],
@@ -922,6 +942,7 @@ static void msp_monitor_print_report(telemetry_monitor_t *m, long long elapsed_m
             (unsigned long long)battery[CRSF_FROM_UDP],
             (unsigned long long)att[CRSF_FROM_UDP],
             (unsigned long long)alt[CRSF_FROM_UDP],
+            (unsigned long long)disp[CRSF_FROM_UDP],
             (unsigned long long)other[CRSF_FROM_UDP],
             (unsigned long long)m->msp_invalid[CRSF_FROM_UDP],
             (unsigned long long)m->msp_frames[CRSF_FROM_UDP]);
@@ -1040,6 +1061,7 @@ static void telemetry_monitor_feed_msp(telemetry_monitor_t *m, crsf_source_t src
                     if (s->expected >= 6) {
                         uint8_t cmd = s->frame[4];
                         m->msp_type_counts[src][cmd]++;
+                        if (cmd == MSP_DISPLAYPORT) m->detect_displayport = true;
 
                         if (m->msp_cb) {
                             // Frame structure: $ M < len cmd payload... checksum
@@ -1917,6 +1939,28 @@ int main(int argc, char **argv){
         }
 
         int timeout_ms=500;
+        if (telemetry.detect_displayport) {
+            struct timespec now; get_mono(&now);
+            long long since_poll = diff_ms(&now, &st.last_msp_poll);
+            long long poll_rate = 200; // 5Hz
+            if (since_poll >= poll_rate) {
+                // Time to poll
+                st.last_msp_poll = now;
+                msp_send_query(&st.uart_out, MSP_ANALOG);
+                msp_send_query(&st.uart_out, MSP_STATUS_EX);
+                msp_send_query(&st.uart_out, MSP_RAW_GPS);
+                msp_send_query(&st.uart_out, MSP_COMP_GPS);
+                msp_send_query(&st.uart_out, MSP_ALTITUDE);
+                msp_send_query(&st.uart_out, MSP_ATTITUDE);
+                msp_send_query(&st.uart_out, MSP_BATTERY_STATE);
+
+                timeout_ms = 0; // Wake up immediately to write
+            } else {
+                long long remain = poll_rate - since_poll;
+                if (remain < timeout_ms) timeout_ms = (int)remain;
+            }
+        }
+
         if(st.udp_out_len>0 && cfg.udp_coalesce_idle_ms>0){
             struct timespec now; get_mono(&now);
             long long waited=diff_ms(&now,&st.last_uart_rx);
