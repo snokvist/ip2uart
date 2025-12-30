@@ -191,6 +191,15 @@ typedef struct {
     size_t pps_hist_pos;
 } crsf_log_state_t;
 
+#define MSP_RAW_GPS          106
+#define MSP_ATTITUDE         108
+#define MSP_ANALOG           110
+#define MSP_BATTERY_STATE    130
+
+typedef void (*msp_frame_handler_t)(crsf_source_t src, uint8_t cmd,
+                                    const uint8_t *payload, size_t payload_len,
+                                    void *user);
+
 typedef struct { uint8_t frame[300]; size_t len; size_t expected; } msp_stream_t;
 
 typedef struct { uint8_t frame[300]; size_t len; size_t expected; bool v2; } mav_stream_t;
@@ -207,6 +216,9 @@ typedef struct {
     crsf_monitor_t crsf;
     crsf_frame_handler_t crsf_cb;
     void *crsf_cb_user;
+
+    msp_frame_handler_t msp_cb;
+    void *msp_cb_user;
 
     telemetry_proto_t protocol[CRSF_SRC_MAX];
 
@@ -832,21 +844,27 @@ static void crsf_monitor_maybe_report(crsf_monitor_t *m)
 /* Telemetry monitor wrapper */
 static void telemetry_monitor_init(telemetry_monitor_t *m, bool enabled,
                                    crsf_frame_handler_t crsf_cb,
-                                   void *crsf_cb_user)
+                                   void *crsf_cb_user,
+                                   msp_frame_handler_t msp_cb,
+                                   void *msp_cb_user)
 {
     memset(m, 0, sizeof(*m));
     m->enabled = enabled;
     m->crsf_cb = crsf_cb;
     m->crsf_cb_user = crsf_cb_user;
+    m->msp_cb = msp_cb;
+    m->msp_cb_user = msp_cb_user;
     crsf_monitor_init(&m->crsf, enabled, crsf_cb, crsf_cb_user);
 }
 
 static void telemetry_monitor_set_enabled(telemetry_monitor_t *m, bool enabled)
 {
     if (m->enabled == enabled) return;
-    crsf_frame_handler_t cb = m->crsf_cb;
-    void *user = m->crsf_cb_user;
-    telemetry_monitor_init(m, enabled, cb, user);
+    crsf_frame_handler_t crsf_cb = m->crsf_cb;
+    void *crsf_user = m->crsf_cb_user;
+    msp_frame_handler_t msp_cb = m->msp_cb;
+    void *msp_user = m->msp_cb_user;
+    telemetry_monitor_init(m, enabled, crsf_cb, crsf_user, msp_cb, msp_user);
 }
 
 static void msp_stream_reset(msp_stream_t *s)
@@ -927,6 +945,15 @@ static void telemetry_monitor_feed_msp(telemetry_monitor_t *m, crsf_source_t src
                 uint8_t expected_checksum = s->frame[s->expected - 1];
                 if (checksum == expected_checksum) {
                     m->msp_frames[src]++;
+                    if (m->msp_cb) {
+                        // Frame structure: $ M < len cmd payload... checksum
+                        // cmd is at index 4, payload starts at 5, len is s->frame[3]
+                        uint8_t cmd = s->frame[4];
+                        size_t payload_len = s->frame[3];
+                        if (5 + payload_len < s->expected) {
+                            m->msp_cb(src, cmd, s->frame + 5, payload_len, m->msp_cb_user);
+                        }
+                    }
                 } else {
                     m->msp_invalid[src]++;
                 }
@@ -1160,6 +1187,19 @@ static void crsf_log_on_frame(crsf_source_t src, uint8_t type, const uint8_t *pa
     crsf_log_update(ctx->cfg, ctx->log, ctx->st, src, type, payload, payload_len);
 }
 
+static void msp_log_update(const config_t *cfg, crsf_log_state_t *log, const state_t *st,
+                           crsf_source_t src, uint8_t cmd, const uint8_t *payload,
+                           size_t payload_len);
+
+static void msp_log_on_frame(crsf_source_t src, uint8_t cmd, const uint8_t *payload,
+                             size_t payload_len, void *user)
+{
+    crsf_log_context_t *ctx = (crsf_log_context_t *)user;
+    if (!ctx || !ctx->cfg || !ctx->log || !ctx->st) return;
+
+    msp_log_update(ctx->cfg, ctx->log, ctx->st, src, cmd, payload, payload_len);
+}
+
 static void crsf_log_reset(crsf_log_state_t *log)
 {
     memset(log, 0, sizeof(*log));
@@ -1366,6 +1406,74 @@ static void crsf_log_update(const config_t *cfg, crsf_log_state_t *log, const st
     crsf_log_maybe_write(cfg, log, st);
 }
 
+static void msp_log_update(const config_t *cfg, crsf_log_state_t *log, const state_t *st,
+                           crsf_source_t src, uint8_t cmd, const uint8_t *payload,
+                           size_t payload_len)
+{
+    if (!log->enabled || src >= CRSF_SRC_MAX) return;
+
+    crsf_log_entry_t *entry = &log->entries[src];
+    entry->has_any = true;
+    get_mono(&entry->last_frame);
+
+    if (cmd == MSP_ANALOG && payload_len >= 7) {
+        // payload: vbat(1), powerMeterSum(2), rssi(2), amperage(2)
+        uint8_t vbat = payload[0];
+        uint16_t amperage = ((uint16_t)payload[6] << 8) | (uint16_t)payload[5];
+
+        entry->voltage_v = (double)vbat / 10.0;
+        // MSP amperage is usually raw ADC or similar, hard to normalize without more info
+        // but often treated as centi-amps in some contexts or raw ADC.
+        // Storing as is for now, similar to CRSF current_raw.
+        entry->current_raw = (double)amperage;
+        entry->has_battery = true;
+        entry->frames_battery++;
+    } else if (cmd == MSP_BATTERY_STATE && payload_len >= 5) {
+        // payload: amperage(2), capacity(2), voltage(1), cellCount(1), legacyVoltage(1), ...
+        // Note: Cleanflight/Betaflight structure.
+        // uint16_t amperage = payload[0] | (payload[1] << 8); // Little endian usually
+        // Let's assume standard MSP little endian for multibyte
+        uint16_t amperage = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
+        uint16_t capacity = (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
+        uint8_t voltage = payload[4];
+        // uint8_t cellCount = payload[5];
+
+        entry->voltage_v = (double)voltage / 10.0;
+        entry->current_raw = (double)amperage; // A * 100 usually
+        entry->capacity_mah = capacity;
+        entry->has_battery = true;
+        entry->frames_battery++;
+    } else if (cmd == MSP_RAW_GPS && payload_len >= 14) {
+        // fix(1), numSat(1), lat(4), lon(4), alt(2), speed(2), ground_course(2)
+        uint8_t sats = payload[1];
+        int32_t lat = (int32_t)((uint32_t)payload[2] | ((uint32_t)payload[3]<<8) | ((uint32_t)payload[4]<<16) | ((uint32_t)payload[5]<<24));
+        int32_t lon = (int32_t)((uint32_t)payload[6] | ((uint32_t)payload[7]<<8) | ((uint32_t)payload[8]<<16) | ((uint32_t)payload[9]<<24));
+        int16_t alt = (int16_t)(payload[10] | (payload[11]<<8));
+        uint16_t speed = (uint16_t)(payload[12] | (payload[13]<<8));
+        // uint16_t course = (uint16_t)(payload[14] | (payload[15]<<8));
+
+        entry->latitude_deg = (double)lat / 1e7;
+        entry->longitude_deg = (double)lon / 1e7;
+        entry->altitude_m = (double)alt; // meters
+        entry->groundspeed_raw = (double)speed; // cm/s
+        entry->sats = sats;
+        entry->has_gps = true;
+        entry->frames_gps++;
+    } else if (cmd == MSP_ATTITUDE && payload_len >= 6) {
+        // roll(2), pitch(2), yaw(2)
+        // int16_t roll = (int16_t)(payload[0] | (payload[1]<<8));
+        // int16_t pitch = (int16_t)(payload[2] | (payload[3]<<8));
+        int16_t yaw = (int16_t)(payload[4] | (payload[5]<<8));
+
+        entry->heading_deg = (double)yaw;
+        entry->frames_other++; // Mapping attitude to 'other' or could act as heading update
+    } else {
+        entry->frames_other++;
+    }
+
+    crsf_log_maybe_write(cfg, log, st);
+}
+
 /* CRSF forwarding */
 static void crsf_forward_reset(state_t *st)
 {
@@ -1524,7 +1632,7 @@ int main(int argc, char **argv){
     crsf_log_context_t log_ctx = { .cfg = &cfg, .log = &st.crsf_log, .st = &st };
     bool telemetry_enabled = cfg.telemetry_detect && (g_verbosity || cfg.crsf_log);
     telemetry_monitor_t telemetry;
-    telemetry_monitor_init(&telemetry, telemetry_enabled, crsf_log_on_frame, &log_ctx);
+    telemetry_monitor_init(&telemetry, telemetry_enabled, crsf_log_on_frame, &log_ctx, msp_log_on_frame, &log_ctx);
 
     size_t udp_out_cap = cfg.udp_max_datagram>0?(size_t)cfg.udp_max_datagram:1200;
     st.udp_out=(uint8_t*)malloc(udp_out_cap);
