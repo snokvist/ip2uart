@@ -1630,18 +1630,20 @@ static void msp_log_update(const config_t *cfg, crsf_log_state_t *log, const sta
         entry->armed = (flags & 1); // Box 0 is usually ARM
         entry->has_status = true;
         entry->frames_other++;
-    } else if (cmd == MSP_RAW_GPS && payload_len >= 14) {
+    } else if (cmd == MSP_RAW_GPS && payload_len >= 16) {
         // fix(1), numSat(1), lat(4), lon(4), alt(2), speed(2), ground_course(2)
         uint8_t sats = payload[1];
         int32_t lat = (int32_t)((uint32_t)payload[2] | ((uint32_t)payload[3]<<8) | ((uint32_t)payload[4]<<16) | ((uint32_t)payload[5]<<24));
         int32_t lon = (int32_t)((uint32_t)payload[6] | ((uint32_t)payload[7]<<8) | ((uint32_t)payload[8]<<16) | ((uint32_t)payload[9]<<24));
         int16_t alt = (int16_t)(payload[10] | (payload[11]<<8));
         uint16_t speed = (uint16_t)(payload[12] | (payload[13]<<8));
+        uint16_t course = (uint16_t)(payload[14] | (payload[15]<<8));
 
         entry->latitude_deg = (double)lat / 1e7;
         entry->longitude_deg = (double)lon / 1e7;
         entry->altitude_m = (double)alt; // meters (GPS)
         entry->groundspeed_raw = (double)speed; // cm/s
+        entry->heading_deg = (double)course / 10.0;
         entry->sats = sats;
         entry->has_gps = true;
         entry->frames_gps++;
