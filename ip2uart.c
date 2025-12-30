@@ -187,6 +187,10 @@ typedef struct {
     double home_dist_m;
     double home_dir_deg;
 
+    bool prev_armed;
+    double armed_start_time;
+    double armed_accumulated_s;
+
     uint64_t frames_rc;
     uint64_t frames_gps;
     uint64_t frames_battery;
@@ -1352,10 +1356,24 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
 {
     if (!log->enabled || !st) return;
 
-    struct timespec now;
-    get_mono(&now);
+    struct timespec now_ts;
+    get_mono(&now_ts);
+    double now_s = (double)now_ts.tv_sec + (double)now_ts.tv_nsec / 1e9;
+
+    // Maintain flight time state
+    for (int i = 0; i < CRSF_SRC_MAX; i++) {
+        crsf_log_entry_t *entry = &log->entries[i];
+        if (entry->armed && !entry->prev_armed) {
+            entry->armed_start_time = now_s;
+        }
+        if (!entry->armed && entry->prev_armed) {
+            entry->armed_accumulated_s += (now_s - entry->armed_start_time);
+        }
+        entry->prev_armed = entry->armed;
+    }
+
     if (log->last_write.tv_sec || log->last_write.tv_nsec) {
-        if (diff_ms(&now, &log->last_write) < cfg->crsf_log_rate_ms) return;
+        if (diff_ms(&now_ts, &log->last_write) < cfg->crsf_log_rate_ms) return;
     }
 
     FILE *f = fopen(cfg->crsf_log_path, "w");
@@ -1366,12 +1384,12 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
 
     long long elapsed_ms = 0;
     if (log->last_rate.tv_sec || log->last_rate.tv_nsec) {
-        elapsed_ms = diff_ms(&now, &log->last_rate);
+        elapsed_ms = diff_ms(&now_ts, &log->last_rate);
     }
     if (elapsed_ms <= 0) {
         log->last_pkts_uart_to_net = st->pkts_uart_to_net;
         log->last_pkts_net_to_uart = st->pkts_net_to_uart;
-        log->last_rate = now;
+        log->last_rate = now_ts;
         elapsed_ms = cfg->crsf_log_rate_ms;
     }
 
@@ -1411,7 +1429,7 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
 
     log->last_pkts_uart_to_net = st->pkts_uart_to_net;
     log->last_pkts_net_to_uart = st->pkts_net_to_uart;
-    log->last_rate = now;
+    log->last_rate = now_ts;
 
     for (int i = 0; i < CRSF_SRC_MAX; i++) {
         const crsf_log_entry_t *entry = &log->entries[i];
@@ -1460,9 +1478,7 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
             fprintf(f, "%sother_kframes=%.1f\n", prefix, oth_kframes);
 
             if (entry->last_frame.tv_sec || entry->last_frame.tv_nsec) {
-                struct timespec now;
-                get_mono(&now);
-                long long age_ms = diff_ms(&now, &entry->last_frame);
+                long long age_ms = diff_ms(&now_ts, &entry->last_frame);
                 if (age_ms < 0) age_ms = 0;
                 fprintf(f, "%slast_frame_age_ms=%lld\n", prefix, age_ms);
             } else {
@@ -1503,10 +1519,20 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
             fprintf(f, "%sroll=\n", prefix);
             fprintf(f, "%spitch=\n", prefix);
         }
+
+        if (entry->armed_accumulated_s > 0 || entry->armed) {
+            double flight_time = entry->armed_accumulated_s;
+            if (entry->armed) {
+                flight_time += (now_s - entry->armed_start_time);
+            }
+            fprintf(f, "%sflight_time_s=%.1f\n", prefix, flight_time);
+        } else {
+            fprintf(f, "%sflight_time_s=\n", prefix);
+        }
     }
 
     fclose(f);
-    log->last_write = now;
+    log->last_write = now_ts;
 }
 
 static void crsf_log_update(const config_t *cfg, crsf_log_state_t *log, const state_t *st,
