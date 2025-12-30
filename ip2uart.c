@@ -890,8 +890,23 @@ static void msp_monitor_print_report(telemetry_monitor_t *m, long long elapsed_m
 
     // Only print if there is some MSP activity
     if (total[CRSF_FROM_UART] > 0 || total[CRSF_FROM_UDP] > 0) {
+        char oth_detail[64] = {0};
+        if (other[CRSF_FROM_UART] > 0) {
+            // Find top unhandled ID
+            int max_id = -1; uint64_t max_c = 0;
+            for (int i = 0; i < 256; i++) {
+                if (i == MSP_STATUS || i == MSP_STATUS_EX || i == MSP_RAW_GPS || i == MSP_COMP_GPS ||
+                    i == MSP_ANALOG || i == MSP_BATTERY_STATE || i == MSP_ATTITUDE || i == MSP_ALTITUDE) continue;
+                if (m->msp_type_counts[CRSF_FROM_UART][i] > max_c) {
+                    max_c = m->msp_type_counts[CRSF_FROM_UART][i];
+                    max_id = i;
+                }
+            }
+            if (max_id >= 0) snprintf(oth_detail, sizeof(oth_detail), " (top_oth:0x%02X=%llu)", max_id, (unsigned long long)max_c);
+        }
+
         fprintf(stderr,
-            "[msp]  uart stat=%llu gps=%llu bat=%llu att=%llu alt=%llu oth=%llu inv=%llu tot=%llu\n"
+            "[msp]  uart stat=%llu gps=%llu bat=%llu att=%llu alt=%llu oth=%llu%s inv=%llu tot=%llu\n"
             "       udp  stat=%llu gps=%llu bat=%llu att=%llu alt=%llu oth=%llu inv=%llu tot=%llu\n",
             (unsigned long long)status[CRSF_FROM_UART],
             (unsigned long long)gps[CRSF_FROM_UART],
@@ -899,6 +914,7 @@ static void msp_monitor_print_report(telemetry_monitor_t *m, long long elapsed_m
             (unsigned long long)att[CRSF_FROM_UART],
             (unsigned long long)alt[CRSF_FROM_UART],
             (unsigned long long)other[CRSF_FROM_UART],
+            oth_detail,
             (unsigned long long)m->msp_invalid[CRSF_FROM_UART],
             (unsigned long long)m->msp_frames[CRSF_FROM_UART],
             (unsigned long long)status[CRSF_FROM_UDP],
