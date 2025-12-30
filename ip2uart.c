@@ -215,6 +215,7 @@ typedef struct {
 #define MSP_ALTITUDE         109
 #define MSP_ANALOG           110
 #define MSP_BATTERY_STATE    130
+#define MSP_STATUS_EX        150
 
 typedef void (*msp_frame_handler_t)(crsf_source_t src, uint8_t cmd,
                                     const uint8_t *payload, size_t payload_len,
@@ -249,6 +250,7 @@ typedef struct {
     msp_stream_t msp_streams[CRSF_SRC_MAX];
     uint64_t msp_frames[CRSF_SRC_MAX];
     uint64_t msp_invalid[CRSF_SRC_MAX];
+    uint64_t msp_type_counts[CRSF_SRC_MAX][256];
 
     mav_stream_t mav_streams[CRSF_SRC_MAX];
     uint64_t mav_frames[CRSF_SRC_MAX];
@@ -861,6 +863,60 @@ static void crsf_monitor_maybe_report(crsf_monitor_t *m)
     }
 }
 
+static void msp_monitor_print_report(telemetry_monitor_t *m, long long elapsed_ms)
+{
+    (void)elapsed_ms;
+    // status(101/150), gps(106/107), bat(110/130), att(108), alt(109), oth, unk
+    uint64_t status[CRSF_SRC_MAX] = {0};
+    uint64_t gps[CRSF_SRC_MAX] = {0};
+    uint64_t battery[CRSF_SRC_MAX] = {0};
+    uint64_t att[CRSF_SRC_MAX] = {0};
+    uint64_t alt[CRSF_SRC_MAX] = {0};
+    uint64_t other[CRSF_SRC_MAX] = {0};
+    uint64_t total[CRSF_SRC_MAX] = {0};
+
+    for (int s = 0; s < CRSF_SRC_MAX; s++) {
+        for (int i = 0; i < 256; i++) {
+            uint64_t c = m->msp_type_counts[s][i];
+            total[s] += c;
+            if (i == MSP_STATUS || i == MSP_STATUS_EX) status[s] += c;
+            else if (i == MSP_RAW_GPS || i == MSP_COMP_GPS) gps[s] += c;
+            else if (i == MSP_ANALOG || i == MSP_BATTERY_STATE) battery[s] += c;
+            else if (i == MSP_ATTITUDE) att[s] += c;
+            else if (i == MSP_ALTITUDE) alt[s] += c;
+            else other[s] += c;
+        }
+    }
+
+    // Only print if there is some MSP activity
+    if (total[CRSF_FROM_UART] > 0 || total[CRSF_FROM_UDP] > 0) {
+        fprintf(stderr,
+            "[msp]  uart stat=%llu gps=%llu bat=%llu att=%llu alt=%llu oth=%llu inv=%llu tot=%llu\n"
+            "       udp  stat=%llu gps=%llu bat=%llu att=%llu alt=%llu oth=%llu inv=%llu tot=%llu\n",
+            (unsigned long long)status[CRSF_FROM_UART],
+            (unsigned long long)gps[CRSF_FROM_UART],
+            (unsigned long long)battery[CRSF_FROM_UART],
+            (unsigned long long)att[CRSF_FROM_UART],
+            (unsigned long long)alt[CRSF_FROM_UART],
+            (unsigned long long)other[CRSF_FROM_UART],
+            (unsigned long long)m->msp_invalid[CRSF_FROM_UART],
+            (unsigned long long)m->msp_frames[CRSF_FROM_UART],
+            (unsigned long long)status[CRSF_FROM_UDP],
+            (unsigned long long)gps[CRSF_FROM_UDP],
+            (unsigned long long)battery[CRSF_FROM_UDP],
+            (unsigned long long)att[CRSF_FROM_UDP],
+            (unsigned long long)alt[CRSF_FROM_UDP],
+            (unsigned long long)other[CRSF_FROM_UDP],
+            (unsigned long long)m->msp_invalid[CRSF_FROM_UDP],
+            (unsigned long long)m->msp_frames[CRSF_FROM_UDP]);
+    }
+
+    for (int s = 0; s < CRSF_SRC_MAX; s++) {
+        memset(m->msp_type_counts[s], 0, sizeof(m->msp_type_counts[s]));
+        // Note: msp_frames and msp_invalid are reset in telemetry_monitor_maybe_report
+    }
+}
+
 /* Telemetry monitor wrapper */
 static void telemetry_monitor_init(telemetry_monitor_t *m, bool enabled,
                                    crsf_frame_handler_t crsf_cb,
@@ -965,13 +1021,17 @@ static void telemetry_monitor_feed_msp(telemetry_monitor_t *m, crsf_source_t src
                 uint8_t expected_checksum = s->frame[s->expected - 1];
                 if (checksum == expected_checksum) {
                     m->msp_frames[src]++;
-                    if (m->msp_cb) {
-                        // Frame structure: $ M < len cmd payload... checksum
-                        // cmd is at index 4, payload starts at 5, len is s->frame[3]
+                    if (s->expected >= 6) {
                         uint8_t cmd = s->frame[4];
-                        size_t payload_len = s->frame[3];
-                        if (5 + payload_len < s->expected) {
-                            m->msp_cb(src, cmd, s->frame + 5, payload_len, m->msp_cb_user);
+                        m->msp_type_counts[src][cmd]++;
+
+                        if (m->msp_cb) {
+                            // Frame structure: $ M < len cmd payload... checksum
+                            // cmd is at index 4, payload starts at 5, len is s->frame[3]
+                            size_t payload_len = s->frame[3];
+                            if (5 + payload_len < s->expected) {
+                                m->msp_cb(src, cmd, s->frame + 5, payload_len, m->msp_cb_user);
+                            }
                         }
                     }
                 } else {
@@ -1167,6 +1227,8 @@ static void telemetry_monitor_maybe_report(telemetry_monitor_t *m)
 
     long long elapsed_ms = diff_ms(&now, &m->last_report);
     if (elapsed_ms < 1000) return;
+
+    msp_monitor_print_report(m, elapsed_ms);
 
     fprintf(stderr,
             "[telemetry] msp uart=%llu udp=%llu inv=%llu\n"
@@ -1496,7 +1558,7 @@ static void msp_log_update(const config_t *cfg, crsf_log_state_t *log, const sta
         entry->capacity_mah = capacity;
         entry->has_battery = true;
         entry->frames_battery++;
-    } else if (cmd == MSP_STATUS && payload_len >= 10) {
+    } else if ((cmd == MSP_STATUS || cmd == MSP_STATUS_EX) && payload_len >= 10) {
         // cycleTime(2), i2c_errors(2), sensor(2), flag(4)
         uint32_t flags = (uint32_t)payload[6] | ((uint32_t)payload[7]<<8) | ((uint32_t)payload[8]<<16) | ((uint32_t)payload[9]<<24);
 
