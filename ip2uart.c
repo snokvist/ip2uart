@@ -156,6 +156,9 @@ typedef struct {
 typedef struct {
     bool has_battery;
     bool has_gps;
+    bool has_status;
+    bool has_baro;
+    bool has_home;
     bool has_any;
 
     double voltage_v;
@@ -169,6 +172,20 @@ typedef struct {
     double heading_deg;
     double altitude_m;
     uint8_t sats;
+
+    bool armed;
+    bool has_attitude;
+    uint32_t flight_mode_flags;
+    uint16_t rssi_raw;
+
+    double roll_deg;
+    double pitch_deg;
+
+    double baro_altitude_m;
+    double vario_m_s;
+
+    double home_dist_m;
+    double home_dir_deg;
 
     uint64_t frames_rc;
     uint64_t frames_gps;
@@ -191,8 +208,11 @@ typedef struct {
     size_t pps_hist_pos;
 } crsf_log_state_t;
 
+#define MSP_STATUS           101
 #define MSP_RAW_GPS          106
+#define MSP_COMP_GPS         107
 #define MSP_ATTITUDE         108
+#define MSP_ALTITUDE         109
 #define MSP_ANALOG           110
 #define MSP_BATTERY_STATE    130
 
@@ -1349,6 +1369,40 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
                 fprintf(f, "%slast_frame_age_ms=\n", prefix);
             }
         }
+
+        if (entry->has_status) {
+            fprintf(f, "%sarmed=%d\n", prefix, entry->armed);
+            fprintf(f, "%smode_flags=0x%08X\n", prefix, entry->flight_mode_flags);
+            fprintf(f, "%srssi=%u\n", prefix, entry->rssi_raw);
+        } else {
+            fprintf(f, "%sarmed=\n", prefix);
+            fprintf(f, "%smode_flags=\n", prefix);
+            fprintf(f, "%srssi=\n", prefix);
+        }
+
+        if (entry->has_home) {
+            fprintf(f, "%shome_dist=%.1f\n", prefix, entry->home_dist_m);
+            fprintf(f, "%shome_dir=%.1f\n", prefix, entry->home_dir_deg);
+        } else {
+            fprintf(f, "%shome_dist=\n", prefix);
+            fprintf(f, "%shome_dir=\n", prefix);
+        }
+
+        if (entry->has_baro) {
+            fprintf(f, "%sbaro_alt=%.1f\n", prefix, entry->baro_altitude_m);
+            fprintf(f, "%svario=%.1f\n", prefix, entry->vario_m_s);
+        } else {
+            fprintf(f, "%sbaro_alt=\n", prefix);
+            fprintf(f, "%svario=\n", prefix);
+        }
+
+        if (entry->has_attitude) {
+            fprintf(f, "%sroll=%.1f\n", prefix, entry->roll_deg);
+            fprintf(f, "%spitch=%.1f\n", prefix, entry->pitch_deg);
+        } else {
+            fprintf(f, "%sroll=\n", prefix);
+            fprintf(f, "%spitch=\n", prefix);
+        }
     }
 
     fclose(f);
@@ -1419,30 +1473,37 @@ static void msp_log_update(const config_t *cfg, crsf_log_state_t *log, const sta
     if (cmd == MSP_ANALOG && payload_len >= 7) {
         // payload: vbat(1), powerMeterSum(2), rssi(2), amperage(2)
         uint8_t vbat = payload[0];
+        uint16_t mah = ((uint16_t)payload[2] << 8) | (uint16_t)payload[1]; // Little endian? usually MSP is. actually bytes are LSB, MSB.
+        // Wait, MSP is LE. payload[1] is LSB, payload[2] is MSB.
+        uint16_t rssi = ((uint16_t)payload[4] << 8) | (uint16_t)payload[3];
         uint16_t amperage = ((uint16_t)payload[6] << 8) | (uint16_t)payload[5];
 
         entry->voltage_v = (double)vbat / 10.0;
-        // MSP amperage is usually raw ADC or similar, hard to normalize without more info
-        // but often treated as centi-amps in some contexts or raw ADC.
-        // Storing as is for now, similar to CRSF current_raw.
         entry->current_raw = (double)amperage;
+        if (!entry->capacity_mah) entry->capacity_mah = mah; // Prefer MSP_BATTERY_STATE if available
+        entry->rssi_raw = rssi;
         entry->has_battery = true;
+        entry->has_status = true; // for rssi
         entry->frames_battery++;
     } else if (cmd == MSP_BATTERY_STATE && payload_len >= 5) {
-        // payload: amperage(2), capacity(2), voltage(1), cellCount(1), legacyVoltage(1), ...
-        // Note: Cleanflight/Betaflight structure.
-        // uint16_t amperage = payload[0] | (payload[1] << 8); // Little endian usually
-        // Let's assume standard MSP little endian for multibyte
+        // payload: amperage(2), capacity(2), voltage(1)
         uint16_t amperage = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
         uint16_t capacity = (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
         uint8_t voltage = payload[4];
-        // uint8_t cellCount = payload[5];
 
         entry->voltage_v = (double)voltage / 10.0;
         entry->current_raw = (double)amperage; // A * 100 usually
         entry->capacity_mah = capacity;
         entry->has_battery = true;
         entry->frames_battery++;
+    } else if (cmd == MSP_STATUS && payload_len >= 10) {
+        // cycleTime(2), i2c_errors(2), sensor(2), flag(4)
+        uint32_t flags = (uint32_t)payload[6] | ((uint32_t)payload[7]<<8) | ((uint32_t)payload[8]<<16) | ((uint32_t)payload[9]<<24);
+
+        entry->flight_mode_flags = flags;
+        entry->armed = (flags & 1); // Box 0 is usually ARM
+        entry->has_status = true;
+        entry->frames_other++;
     } else if (cmd == MSP_RAW_GPS && payload_len >= 14) {
         // fix(1), numSat(1), lat(4), lon(4), alt(2), speed(2), ground_course(2)
         uint8_t sats = payload[1];
@@ -1450,23 +1511,43 @@ static void msp_log_update(const config_t *cfg, crsf_log_state_t *log, const sta
         int32_t lon = (int32_t)((uint32_t)payload[6] | ((uint32_t)payload[7]<<8) | ((uint32_t)payload[8]<<16) | ((uint32_t)payload[9]<<24));
         int16_t alt = (int16_t)(payload[10] | (payload[11]<<8));
         uint16_t speed = (uint16_t)(payload[12] | (payload[13]<<8));
-        // uint16_t course = (uint16_t)(payload[14] | (payload[15]<<8));
 
         entry->latitude_deg = (double)lat / 1e7;
         entry->longitude_deg = (double)lon / 1e7;
-        entry->altitude_m = (double)alt; // meters
+        entry->altitude_m = (double)alt; // meters (GPS)
         entry->groundspeed_raw = (double)speed; // cm/s
         entry->sats = sats;
         entry->has_gps = true;
         entry->frames_gps++;
+    } else if (cmd == MSP_COMP_GPS && payload_len >= 4) {
+        // distanceToHome(2), directionToHome(2)
+        uint16_t dist = (uint16_t)payload[0] | ((uint16_t)payload[1]<<8);
+        uint16_t dir = (uint16_t)payload[2] | ((uint16_t)payload[3]<<8);
+
+        entry->home_dist_m = (double)dist;
+        entry->home_dir_deg = (double)dir;
+        entry->has_home = true;
+        entry->frames_gps++;
+    } else if (cmd == MSP_ALTITUDE && payload_len >= 6) {
+        // EstAlt(4) cm, Vario(2) cm/s
+        int32_t alt_cm = (int32_t)((uint32_t)payload[0] | ((uint32_t)payload[1]<<8) | ((uint32_t)payload[2]<<16) | ((uint32_t)payload[3]<<24));
+        int16_t vario_cms = (int16_t)(payload[4] | (payload[5]<<8));
+
+        entry->baro_altitude_m = (double)alt_cm / 100.0;
+        entry->vario_m_s = (double)vario_cms / 100.0;
+        entry->has_baro = true;
+        entry->frames_other++;
     } else if (cmd == MSP_ATTITUDE && payload_len >= 6) {
         // roll(2), pitch(2), yaw(2)
-        // int16_t roll = (int16_t)(payload[0] | (payload[1]<<8));
-        // int16_t pitch = (int16_t)(payload[2] | (payload[3]<<8));
+        int16_t roll = (int16_t)(payload[0] | (payload[1]<<8));
+        int16_t pitch = (int16_t)(payload[2] | (payload[3]<<8));
         int16_t yaw = (int16_t)(payload[4] | (payload[5]<<8));
 
-        entry->heading_deg = (double)yaw;
-        entry->frames_other++; // Mapping attitude to 'other' or could act as heading update
+        entry->roll_deg = (double)roll / 10.0;
+        entry->pitch_deg = (double)pitch / 10.0;
+        entry->heading_deg = (double)yaw / 10.0;
+        entry->has_attitude = true;
+        entry->frames_other++;
     } else {
         entry->frames_other++;
     }
