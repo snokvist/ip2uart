@@ -156,6 +156,9 @@ typedef struct {
 typedef struct {
     bool has_battery;
     bool has_gps;
+    bool has_status;
+    bool has_baro;
+    bool has_home;
     bool has_any;
 
     double voltage_v;
@@ -169,6 +172,24 @@ typedef struct {
     double heading_deg;
     double altitude_m;
     uint8_t sats;
+
+    bool armed;
+    bool has_attitude;
+    uint32_t flight_mode_flags;
+    uint16_t rssi_raw;
+
+    double roll_deg;
+    double pitch_deg;
+
+    double baro_altitude_m;
+    double vario_m_s;
+
+    double home_dist_m;
+    double home_dir_deg;
+
+    bool prev_armed;
+    double armed_start_time;
+    double armed_accumulated_s;
 
     uint64_t frames_rc;
     uint64_t frames_gps;
@@ -191,6 +212,20 @@ typedef struct {
     size_t pps_hist_pos;
 } crsf_log_state_t;
 
+#define MSP_STATUS           101
+#define MSP_RAW_GPS          106
+#define MSP_COMP_GPS         107
+#define MSP_ATTITUDE         108
+#define MSP_ALTITUDE         109
+#define MSP_ANALOG           110
+#define MSP_BATTERY_STATE    130
+#define MSP_STATUS_EX        150
+#define MSP_DISPLAYPORT      182
+
+typedef void (*msp_frame_handler_t)(crsf_source_t src, uint8_t cmd,
+                                    const uint8_t *payload, size_t payload_len,
+                                    void *user);
+
 typedef struct { uint8_t frame[300]; size_t len; size_t expected; } msp_stream_t;
 
 typedef struct { uint8_t frame[300]; size_t len; size_t expected; bool v2; } mav_stream_t;
@@ -204,9 +239,13 @@ typedef enum {
 
 typedef struct {
     bool enabled;
+    bool detect_displayport;
     crsf_monitor_t crsf;
     crsf_frame_handler_t crsf_cb;
     void *crsf_cb_user;
+
+    msp_frame_handler_t msp_cb;
+    void *msp_cb_user;
 
     telemetry_proto_t protocol[CRSF_SRC_MAX];
 
@@ -217,6 +256,7 @@ typedef struct {
     msp_stream_t msp_streams[CRSF_SRC_MAX];
     uint64_t msp_frames[CRSF_SRC_MAX];
     uint64_t msp_invalid[CRSF_SRC_MAX];
+    uint64_t msp_type_counts[CRSF_SRC_MAX][256];
 
     mav_stream_t mav_streams[CRSF_SRC_MAX];
     uint64_t mav_frames[CRSF_SRC_MAX];
@@ -257,6 +297,7 @@ typedef struct {
 
     // timers
     struct timespec last_uart_rx; // for UDP idle
+    struct timespec last_msp_poll;
     struct timespec last_stats_report;
     uint64_t last_report_pkts_uart_to_net;
     uint64_t last_report_pkts_net_to_uart;
@@ -829,24 +870,118 @@ static void crsf_monitor_maybe_report(crsf_monitor_t *m)
     }
 }
 
+static void msp_send_query(ringbuf_t *r, uint8_t cmd)
+{
+    // MSP v1 request: $ M < 0 cmd checksum
+    uint8_t buf[6];
+    buf[0] = '$';
+    buf[1] = 'M';
+    buf[2] = '<';
+    buf[3] = 0;
+    buf[4] = cmd;
+    buf[5] = cmd; // checksum for size=0 is cmd^size = cmd^0 = cmd
+
+    ring_write(r, buf, 6);
+}
+
+static void msp_monitor_print_report(telemetry_monitor_t *m, long long elapsed_ms)
+{
+    (void)elapsed_ms;
+    // status(101/150), gps(106/107), bat(110/130), att(108), alt(109), disp(182), oth, unk
+    uint64_t status[CRSF_SRC_MAX] = {0};
+    uint64_t gps[CRSF_SRC_MAX] = {0};
+    uint64_t battery[CRSF_SRC_MAX] = {0};
+    uint64_t att[CRSF_SRC_MAX] = {0};
+    uint64_t alt[CRSF_SRC_MAX] = {0};
+    uint64_t disp[CRSF_SRC_MAX] = {0};
+    uint64_t other[CRSF_SRC_MAX] = {0};
+    uint64_t total[CRSF_SRC_MAX] = {0};
+
+    for (int s = 0; s < CRSF_SRC_MAX; s++) {
+        for (int i = 0; i < 256; i++) {
+            uint64_t c = m->msp_type_counts[s][i];
+            total[s] += c;
+            if (i == MSP_STATUS || i == MSP_STATUS_EX) status[s] += c;
+            else if (i == MSP_RAW_GPS || i == MSP_COMP_GPS) gps[s] += c;
+            else if (i == MSP_ANALOG || i == MSP_BATTERY_STATE) battery[s] += c;
+            else if (i == MSP_ATTITUDE) att[s] += c;
+            else if (i == MSP_ALTITUDE) alt[s] += c;
+            else if (i == MSP_DISPLAYPORT) disp[s] += c;
+            else other[s] += c;
+        }
+    }
+
+    // Only print if there is some MSP activity
+    if (total[CRSF_FROM_UART] > 0 || total[CRSF_FROM_UDP] > 0) {
+        char oth_detail[64] = {0};
+        if (other[CRSF_FROM_UART] > 0) {
+            // Find top unhandled ID
+            int max_id = -1; uint64_t max_c = 0;
+            for (int i = 0; i < 256; i++) {
+                if (i == MSP_STATUS || i == MSP_STATUS_EX || i == MSP_RAW_GPS || i == MSP_COMP_GPS ||
+                    i == MSP_ANALOG || i == MSP_BATTERY_STATE || i == MSP_ATTITUDE || i == MSP_ALTITUDE || i == MSP_DISPLAYPORT) continue;
+                if (m->msp_type_counts[CRSF_FROM_UART][i] > max_c) {
+                    max_c = m->msp_type_counts[CRSF_FROM_UART][i];
+                    max_id = i;
+                }
+            }
+            if (max_id >= 0) snprintf(oth_detail, sizeof(oth_detail), " (top_oth:0x%02X=%llu)", max_id, (unsigned long long)max_c);
+        }
+
+        fprintf(stderr,
+            "[msp]  uart stat=%llu gps=%llu bat=%llu att=%llu alt=%llu disp=%llu oth=%llu%s inv=%llu tot=%llu\n"
+            "       udp  stat=%llu gps=%llu bat=%llu att=%llu alt=%llu disp=%llu oth=%llu inv=%llu tot=%llu\n",
+            (unsigned long long)status[CRSF_FROM_UART],
+            (unsigned long long)gps[CRSF_FROM_UART],
+            (unsigned long long)battery[CRSF_FROM_UART],
+            (unsigned long long)att[CRSF_FROM_UART],
+            (unsigned long long)alt[CRSF_FROM_UART],
+            (unsigned long long)disp[CRSF_FROM_UART],
+            (unsigned long long)other[CRSF_FROM_UART],
+            oth_detail,
+            (unsigned long long)m->msp_invalid[CRSF_FROM_UART],
+            (unsigned long long)m->msp_frames[CRSF_FROM_UART],
+            (unsigned long long)status[CRSF_FROM_UDP],
+            (unsigned long long)gps[CRSF_FROM_UDP],
+            (unsigned long long)battery[CRSF_FROM_UDP],
+            (unsigned long long)att[CRSF_FROM_UDP],
+            (unsigned long long)alt[CRSF_FROM_UDP],
+            (unsigned long long)disp[CRSF_FROM_UDP],
+            (unsigned long long)other[CRSF_FROM_UDP],
+            (unsigned long long)m->msp_invalid[CRSF_FROM_UDP],
+            (unsigned long long)m->msp_frames[CRSF_FROM_UDP]);
+    }
+
+    for (int s = 0; s < CRSF_SRC_MAX; s++) {
+        memset(m->msp_type_counts[s], 0, sizeof(m->msp_type_counts[s]));
+        // Note: msp_frames and msp_invalid are reset in telemetry_monitor_maybe_report
+    }
+}
+
 /* Telemetry monitor wrapper */
 static void telemetry_monitor_init(telemetry_monitor_t *m, bool enabled,
                                    crsf_frame_handler_t crsf_cb,
-                                   void *crsf_cb_user)
+                                   void *crsf_cb_user,
+                                   msp_frame_handler_t msp_cb,
+                                   void *msp_cb_user)
 {
     memset(m, 0, sizeof(*m));
     m->enabled = enabled;
     m->crsf_cb = crsf_cb;
     m->crsf_cb_user = crsf_cb_user;
+    m->msp_cb = msp_cb;
+    m->msp_cb_user = msp_cb_user;
     crsf_monitor_init(&m->crsf, enabled, crsf_cb, crsf_cb_user);
 }
 
 static void telemetry_monitor_set_enabled(telemetry_monitor_t *m, bool enabled)
 {
     if (m->enabled == enabled) return;
-    crsf_frame_handler_t cb = m->crsf_cb;
-    void *user = m->crsf_cb_user;
-    telemetry_monitor_init(m, enabled, cb, user);
+    crsf_frame_handler_t crsf_cb = m->crsf_cb;
+    void *crsf_user = m->crsf_cb_user;
+    msp_frame_handler_t msp_cb = m->msp_cb;
+    void *msp_user = m->msp_cb_user;
+    telemetry_monitor_init(m, enabled, crsf_cb, crsf_user, msp_cb, msp_user);
 }
 
 static void msp_stream_reset(msp_stream_t *s)
@@ -927,6 +1062,20 @@ static void telemetry_monitor_feed_msp(telemetry_monitor_t *m, crsf_source_t src
                 uint8_t expected_checksum = s->frame[s->expected - 1];
                 if (checksum == expected_checksum) {
                     m->msp_frames[src]++;
+                    if (s->expected >= 6) {
+                        uint8_t cmd = s->frame[4];
+                        m->msp_type_counts[src][cmd]++;
+                        if (cmd == MSP_DISPLAYPORT) m->detect_displayport = true;
+
+                        if (m->msp_cb) {
+                            // Frame structure: $ M < len cmd payload... checksum
+                            // cmd is at index 4, payload starts at 5, len is s->frame[3]
+                            size_t payload_len = s->frame[3];
+                            if (5 + payload_len < s->expected) {
+                                m->msp_cb(src, cmd, s->frame + 5, payload_len, m->msp_cb_user);
+                            }
+                        }
+                    }
                 } else {
                     m->msp_invalid[src]++;
                 }
@@ -1121,6 +1270,8 @@ static void telemetry_monitor_maybe_report(telemetry_monitor_t *m)
     long long elapsed_ms = diff_ms(&now, &m->last_report);
     if (elapsed_ms < 1000) return;
 
+    msp_monitor_print_report(m, elapsed_ms);
+
     fprintf(stderr,
             "[telemetry] msp uart=%llu udp=%llu inv=%llu\n"
             "            mav uart=%llu udp=%llu inv=%llu\n",
@@ -1160,6 +1311,19 @@ static void crsf_log_on_frame(crsf_source_t src, uint8_t type, const uint8_t *pa
     crsf_log_update(ctx->cfg, ctx->log, ctx->st, src, type, payload, payload_len);
 }
 
+static void msp_log_update(const config_t *cfg, crsf_log_state_t *log, const state_t *st,
+                           crsf_source_t src, uint8_t cmd, const uint8_t *payload,
+                           size_t payload_len);
+
+static void msp_log_on_frame(crsf_source_t src, uint8_t cmd, const uint8_t *payload,
+                             size_t payload_len, void *user)
+{
+    crsf_log_context_t *ctx = (crsf_log_context_t *)user;
+    if (!ctx || !ctx->cfg || !ctx->log || !ctx->st) return;
+
+    msp_log_update(ctx->cfg, ctx->log, ctx->st, src, cmd, payload, payload_len);
+}
+
 static void crsf_log_reset(crsf_log_state_t *log)
 {
     memset(log, 0, sizeof(*log));
@@ -1192,10 +1356,24 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
 {
     if (!log->enabled || !st) return;
 
-    struct timespec now;
-    get_mono(&now);
+    struct timespec now_ts;
+    get_mono(&now_ts);
+    double now_s = (double)now_ts.tv_sec + (double)now_ts.tv_nsec / 1e9;
+
+    // Maintain flight time state
+    for (int i = 0; i < CRSF_SRC_MAX; i++) {
+        crsf_log_entry_t *entry = &log->entries[i];
+        if (entry->armed && !entry->prev_armed) {
+            entry->armed_start_time = now_s;
+        }
+        if (!entry->armed && entry->prev_armed) {
+            entry->armed_accumulated_s += (now_s - entry->armed_start_time);
+        }
+        entry->prev_armed = entry->armed;
+    }
+
     if (log->last_write.tv_sec || log->last_write.tv_nsec) {
-        if (diff_ms(&now, &log->last_write) < cfg->crsf_log_rate_ms) return;
+        if (diff_ms(&now_ts, &log->last_write) < cfg->crsf_log_rate_ms) return;
     }
 
     FILE *f = fopen(cfg->crsf_log_path, "w");
@@ -1206,12 +1384,12 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
 
     long long elapsed_ms = 0;
     if (log->last_rate.tv_sec || log->last_rate.tv_nsec) {
-        elapsed_ms = diff_ms(&now, &log->last_rate);
+        elapsed_ms = diff_ms(&now_ts, &log->last_rate);
     }
     if (elapsed_ms <= 0) {
         log->last_pkts_uart_to_net = st->pkts_uart_to_net;
         log->last_pkts_net_to_uart = st->pkts_net_to_uart;
-        log->last_rate = now;
+        log->last_rate = now_ts;
         elapsed_ms = cfg->crsf_log_rate_ms;
     }
 
@@ -1251,7 +1429,7 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
 
     log->last_pkts_uart_to_net = st->pkts_uart_to_net;
     log->last_pkts_net_to_uart = st->pkts_net_to_uart;
-    log->last_rate = now;
+    log->last_rate = now_ts;
 
     for (int i = 0; i < CRSF_SRC_MAX; i++) {
         const crsf_log_entry_t *entry = &log->entries[i];
@@ -1300,19 +1478,61 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
             fprintf(f, "%sother_kframes=%.1f\n", prefix, oth_kframes);
 
             if (entry->last_frame.tv_sec || entry->last_frame.tv_nsec) {
-                struct timespec now;
-                get_mono(&now);
-                long long age_ms = diff_ms(&now, &entry->last_frame);
+                long long age_ms = diff_ms(&now_ts, &entry->last_frame);
                 if (age_ms < 0) age_ms = 0;
                 fprintf(f, "%slast_frame_age_ms=%lld\n", prefix, age_ms);
             } else {
                 fprintf(f, "%slast_frame_age_ms=\n", prefix);
             }
         }
+
+        if (entry->has_status) {
+            fprintf(f, "%sarmed=%d\n", prefix, entry->armed);
+            fprintf(f, "%smode_flags=0x%08X\n", prefix, entry->flight_mode_flags);
+            fprintf(f, "%srssi=%u\n", prefix, entry->rssi_raw);
+        } else {
+            fprintf(f, "%sarmed=\n", prefix);
+            fprintf(f, "%smode_flags=\n", prefix);
+            fprintf(f, "%srssi=\n", prefix);
+        }
+
+        if (entry->has_home) {
+            fprintf(f, "%shome_dist=%.1f\n", prefix, entry->home_dist_m);
+            fprintf(f, "%shome_dir=%.1f\n", prefix, entry->home_dir_deg);
+        } else {
+            fprintf(f, "%shome_dist=\n", prefix);
+            fprintf(f, "%shome_dir=\n", prefix);
+        }
+
+        if (entry->has_baro) {
+            fprintf(f, "%sbaro_alt=%.1f\n", prefix, entry->baro_altitude_m);
+            fprintf(f, "%svario=%.1f\n", prefix, entry->vario_m_s);
+        } else {
+            fprintf(f, "%sbaro_alt=\n", prefix);
+            fprintf(f, "%svario=\n", prefix);
+        }
+
+        if (entry->has_attitude) {
+            fprintf(f, "%sroll=%.1f\n", prefix, entry->roll_deg);
+            fprintf(f, "%spitch=%.1f\n", prefix, entry->pitch_deg);
+        } else {
+            fprintf(f, "%sroll=\n", prefix);
+            fprintf(f, "%spitch=\n", prefix);
+        }
+
+        if (entry->armed_accumulated_s > 0 || entry->armed) {
+            double flight_time = entry->armed_accumulated_s;
+            if (entry->armed) {
+                flight_time += (now_s - entry->armed_start_time);
+            }
+            fprintf(f, "%sflight_time_s=%.1f\n", prefix, flight_time);
+        } else {
+            fprintf(f, "%sflight_time_s=\n", prefix);
+        }
     }
 
     fclose(f);
-    log->last_write = now;
+    log->last_write = now_ts;
 }
 
 static void crsf_log_update(const config_t *cfg, crsf_log_state_t *log, const state_t *st,
@@ -1359,6 +1579,103 @@ static void crsf_log_update(const config_t *cfg, crsf_log_state_t *log, const st
         entry->frames_rc++;
     } else if (type == 0x14) {
         entry->frames_link_stats++;
+    } else {
+        entry->frames_other++;
+    }
+
+    crsf_log_maybe_write(cfg, log, st);
+}
+
+static void msp_log_update(const config_t *cfg, crsf_log_state_t *log, const state_t *st,
+                           crsf_source_t src, uint8_t cmd, const uint8_t *payload,
+                           size_t payload_len)
+{
+    if (!log->enabled || src >= CRSF_SRC_MAX) return;
+
+    crsf_log_entry_t *entry = &log->entries[src];
+    entry->has_any = true;
+    get_mono(&entry->last_frame);
+
+    if (cmd == MSP_ANALOG && payload_len >= 7) {
+        // payload: vbat(1), powerMeterSum(2), rssi(2), amperage(2)
+        uint8_t vbat = payload[0];
+        uint16_t mah = ((uint16_t)payload[2] << 8) | (uint16_t)payload[1]; // Little endian? usually MSP is. actually bytes are LSB, MSB.
+        // Wait, MSP is LE. payload[1] is LSB, payload[2] is MSB.
+        uint16_t rssi = ((uint16_t)payload[4] << 8) | (uint16_t)payload[3];
+        uint16_t amperage = ((uint16_t)payload[6] << 8) | (uint16_t)payload[5];
+
+        entry->voltage_v = (double)vbat / 10.0;
+        entry->current_raw = (double)amperage;
+        if (!entry->capacity_mah) entry->capacity_mah = mah; // Prefer MSP_BATTERY_STATE if available
+        entry->rssi_raw = rssi;
+        entry->has_battery = true;
+        entry->has_status = true; // for rssi
+        entry->frames_battery++;
+    } else if (cmd == MSP_BATTERY_STATE && payload_len >= 5) {
+        // payload: amperage(2), capacity(2), voltage(1)
+        uint16_t amperage = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
+        uint16_t capacity = (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
+        uint8_t voltage = payload[4];
+
+        // entry->voltage_v = (double)voltage / 10.0; // Avoid conflict with MSP_ANALOG
+        // entry->current_raw = (double)amperage; // Avoid conflict with MSP_ANALOG
+        entry->capacity_mah = capacity;
+        entry->has_battery = true;
+        entry->frames_battery++;
+    } else if ((cmd == MSP_STATUS || cmd == MSP_STATUS_EX) && payload_len >= 10) {
+        // cycleTime(2), i2c_errors(2), sensor(2), flag(4)
+        uint32_t flags = (uint32_t)payload[6] | ((uint32_t)payload[7]<<8) | ((uint32_t)payload[8]<<16) | ((uint32_t)payload[9]<<24);
+
+        entry->flight_mode_flags = flags;
+        entry->armed = (flags & 1); // Box 0 is usually ARM
+        entry->has_status = true;
+        entry->frames_other++;
+    } else if (cmd == MSP_RAW_GPS && payload_len >= 16) {
+        // fix(1), numSat(1), lat(4), lon(4), alt(2), speed(2), ground_course(2)
+        uint8_t sats = payload[1];
+        int32_t lat = (int32_t)((uint32_t)payload[2] | ((uint32_t)payload[3]<<8) | ((uint32_t)payload[4]<<16) | ((uint32_t)payload[5]<<24));
+        int32_t lon = (int32_t)((uint32_t)payload[6] | ((uint32_t)payload[7]<<8) | ((uint32_t)payload[8]<<16) | ((uint32_t)payload[9]<<24));
+        int16_t alt = (int16_t)(payload[10] | (payload[11]<<8));
+        uint16_t speed = (uint16_t)(payload[12] | (payload[13]<<8));
+        uint16_t course = (uint16_t)(payload[14] | (payload[15]<<8));
+
+        entry->latitude_deg = (double)lat / 1e7;
+        entry->longitude_deg = (double)lon / 1e7;
+        entry->altitude_m = (double)alt; // meters (GPS)
+        entry->groundspeed_raw = (double)speed; // cm/s
+        entry->heading_deg = (double)course / 10.0;
+        entry->sats = sats;
+        entry->has_gps = true;
+        entry->frames_gps++;
+    } else if (cmd == MSP_COMP_GPS && payload_len >= 4) {
+        // distanceToHome(2), directionToHome(2)
+        uint16_t dist = (uint16_t)payload[0] | ((uint16_t)payload[1]<<8);
+        uint16_t dir = (uint16_t)payload[2] | ((uint16_t)payload[3]<<8);
+
+        entry->home_dist_m = (double)dist;
+        entry->home_dir_deg = (double)dir;
+        entry->has_home = true;
+        entry->frames_gps++;
+    } else if (cmd == MSP_ALTITUDE && payload_len >= 6) {
+        // EstAlt(4) cm, Vario(2) cm/s
+        int32_t alt_cm = (int32_t)((uint32_t)payload[0] | ((uint32_t)payload[1]<<8) | ((uint32_t)payload[2]<<16) | ((uint32_t)payload[3]<<24));
+        int16_t vario_cms = (int16_t)(payload[4] | (payload[5]<<8));
+
+        entry->baro_altitude_m = (double)alt_cm / 100.0;
+        entry->vario_m_s = (double)vario_cms / 100.0;
+        entry->has_baro = true;
+        entry->frames_other++;
+    } else if (cmd == MSP_ATTITUDE && payload_len >= 6) {
+        // roll(2), pitch(2), yaw(2)
+        int16_t roll = (int16_t)(payload[0] | (payload[1]<<8));
+        int16_t pitch = (int16_t)(payload[2] | (payload[3]<<8));
+        int16_t yaw = (int16_t)(payload[4] | (payload[5]<<8));
+
+        entry->roll_deg = (double)roll / 10.0;
+        entry->pitch_deg = (double)pitch / 10.0;
+        entry->heading_deg = (double)yaw / 10.0;
+        entry->has_attitude = true;
+        entry->frames_other++;
     } else {
         entry->frames_other++;
     }
@@ -1524,7 +1841,7 @@ int main(int argc, char **argv){
     crsf_log_context_t log_ctx = { .cfg = &cfg, .log = &st.crsf_log, .st = &st };
     bool telemetry_enabled = cfg.telemetry_detect && (g_verbosity || cfg.crsf_log);
     telemetry_monitor_t telemetry;
-    telemetry_monitor_init(&telemetry, telemetry_enabled, crsf_log_on_frame, &log_ctx);
+    telemetry_monitor_init(&telemetry, telemetry_enabled, crsf_log_on_frame, &log_ctx, msp_log_on_frame, &log_ctx);
 
     size_t udp_out_cap = cfg.udp_max_datagram>0?(size_t)cfg.udp_max_datagram:1200;
     st.udp_out=(uint8_t*)malloc(udp_out_cap);
@@ -1650,6 +1967,28 @@ int main(int argc, char **argv){
         }
 
         int timeout_ms=500;
+        if (telemetry.detect_displayport) {
+            struct timespec now; get_mono(&now);
+            long long since_poll = diff_ms(&now, &st.last_msp_poll);
+            long long poll_rate = 200; // 5Hz
+            if (since_poll >= poll_rate) {
+                // Time to poll
+                st.last_msp_poll = now;
+                msp_send_query(&st.uart_out, MSP_ANALOG);
+                msp_send_query(&st.uart_out, MSP_STATUS_EX);
+                msp_send_query(&st.uart_out, MSP_RAW_GPS);
+                msp_send_query(&st.uart_out, MSP_COMP_GPS);
+                msp_send_query(&st.uart_out, MSP_ALTITUDE);
+                msp_send_query(&st.uart_out, MSP_ATTITUDE);
+                msp_send_query(&st.uart_out, MSP_BATTERY_STATE);
+
+                timeout_ms = 0; // Wake up immediately to write
+            } else {
+                long long remain = poll_rate - since_poll;
+                if (remain < timeout_ms) timeout_ms = (int)remain;
+            }
+        }
+
         if(st.udp_out_len>0 && cfg.udp_coalesce_idle_ms>0){
             struct timespec now; get_mono(&now);
             long long waited=diff_ms(&now,&st.last_uart_rx);
