@@ -1618,7 +1618,7 @@ static void msp_log_update(const config_t *cfg, crsf_log_state_t *log, const sta
         uint8_t voltage = payload[4];
 
         // entry->voltage_v = (double)voltage / 10.0; // Avoid conflict with MSP_ANALOG
-        entry->current_raw = (double)amperage; // A * 100 usually
+        // entry->current_raw = (double)amperage; // Avoid conflict with MSP_ANALOG
         entry->capacity_mah = capacity;
         entry->has_battery = true;
         entry->frames_battery++;
