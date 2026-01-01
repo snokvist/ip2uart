@@ -919,7 +919,7 @@ static void msp_send_query(ringbuf_t *r, uint8_t cmd)
     buf[2] = '<';
     buf[3] = 0;
     buf[4] = cmd;
-    buf[5] = cmd; // checksum for size=0 is cmd^size = cmd^0 = cmd
+    buf[5] = 0 ^ cmd; // checksum for size=0 is cmd^size = cmd^0 = cmd
 
     ring_write(r, buf, 6);
 }
@@ -1008,6 +1008,13 @@ static void telemetry_monitor_init(telemetry_monitor_t *m, bool enabled, config_
     memset(m, 0, sizeof(*m));
     m->enabled = enabled;
     m->config_proto = forced_proto;
+
+    telemetry_proto_t p = TELEMETRY_PROTO_UNKNOWN;
+    if (forced_proto == PROTO_CRSF) p = TELEMETRY_PROTO_CRSF;
+    else if (forced_proto == PROTO_MSP) p = TELEMETRY_PROTO_MSP;
+    else if (forced_proto == PROTO_MAV) p = TELEMETRY_PROTO_MAV;
+    for(int i=0; i<CRSF_SRC_MAX; i++) m->protocol[i] = p;
+
     m->crsf_cb = crsf_cb;
     m->crsf_cb_user = crsf_cb_user;
     m->msp_cb = msp_cb;
@@ -1780,7 +1787,7 @@ int main(int argc, char **argv){
     for (int i=1;i<argc;i++){
         if (!strcmp(argv[i],"-c") && i+1<argc) { conf_path=argv[++i]; }
         else if (argv[i][0]=='-' && argv[i][1]=='v') {
-            g_verbosity = 1;
+            g_verbosity++;
         } else if(!strcmp(argv[i],"-h")||!strcmp(argv[i],"--help")){
             fprintf(stderr,
                 "Usage: %s [-c /path/to/conf] [-v]\n"
@@ -2018,6 +2025,7 @@ int main(int argc, char **argv){
             if(fd==st.fd_uart && (ev&EPOLLIN)){
                 ssize_t r=read(st.fd_uart,(void*)buf_uart,cfg.rx_buf);
                 if(r>0){
+                    vlog(3, "UART rx: %zd bytes", r);
                     bool telemetry_mode = cfg.telemetry_proto != PROTO_OFF;
 
                     get_mono(&st.last_uart_rx);
