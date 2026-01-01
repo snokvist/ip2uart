@@ -96,7 +96,6 @@ static void ring_consume(ringbuf_t *r, size_t n){ if (n>r->len) n=r->len; r->tai
 /* --------------------------------- Config ----------------------------------- */
 typedef enum {
     PROTO_OFF = 0,
-    PROTO_AUTO,
     PROTO_CRSF,
     PROTO_MSP,
     PROTO_MAV
@@ -423,6 +422,8 @@ static int parse_config(const char *path, config_t *cfg){
 
         trim(key); trim(val); if(!*key) continue;
 
+        vlog(1, "Parsed: %s = %s", key, val);
+
         if(!strcmp(key,"uart_backend")){
             if(!strcmp(val,"tty")) cfg->uart_backend=UART_TTY;
             else if(!strcmp(val,"stdio")) cfg->uart_backend=UART_STDIO;
@@ -452,8 +453,7 @@ static int parse_config(const char *path, config_t *cfg){
         else if(!strcmp(key,"rx_buf")) cfg->rx_buf=(size_t)strtoul(val,NULL,10);
         else if(!strcmp(key,"tx_buf")) cfg->tx_buf=(size_t)strtoul(val,NULL,10);
         else if(!strcmp(key,"telemetry_proto")){
-            if (!strcmp(val,"auto")) cfg->telemetry_proto=PROTO_AUTO;
-            else if (!strcmp(val,"crsf")) cfg->telemetry_proto=PROTO_CRSF;
+            if (!strcmp(val,"crsf")) cfg->telemetry_proto=PROTO_CRSF;
             else if (!strcmp(val,"msp")) cfg->telemetry_proto=PROTO_MSP;
             else if (!strcmp(val,"mavlink")) cfg->telemetry_proto=PROTO_MAV;
             else cfg->telemetry_proto=PROTO_OFF;
