@@ -258,10 +258,6 @@ typedef struct {
 
     telemetry_proto_t protocol[CRSF_SRC_MAX];
 
-    uint8_t detect_tail[CRSF_SRC_MAX][2];
-    size_t detect_tail_len[CRSF_SRC_MAX];
-    size_t undecided_bytes[CRSF_SRC_MAX];
-
     msp_stream_t msp_streams[CRSF_SRC_MAX];
     uint64_t msp_frames[CRSF_SRC_MAX];
     uint64_t msp_invalid[CRSF_SRC_MAX];
@@ -595,12 +591,6 @@ static int reopen_everything(const config_t *cfg, state_t *st){
         st->udp_peer.sin_family=AF_INET; st->udp_peer.sin_port=htons(cfg->udp_peer_port);
         if(inet_pton(AF_INET,cfg->udp_peer_addr,&st->udp_peer.sin_addr)==1) st->udp_peer_set=true;
     }
-
-    // Determine actual parity char for logging
-    const char *par = "N";
-    if (!strcmp(cfg->uart_parity, "even")) par = "E";
-    else if (!strcmp(cfg->uart_parity, "odd")) par = "O";
-    // Else it falls back to None, so print N to avoid confusion if parsing failed
 
     vlog(1, "UDP peer: bind %s:%d -> peer %s:%d (coalesce=%dB/%dms, max=%dB)",
          cfg->udp_bind_addr, cfg->udp_bind_port,
