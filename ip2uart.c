@@ -249,8 +249,7 @@ typedef enum {
 
 typedef struct {
     bool enabled;
-    config_proto_t forced_proto;
-    bool detect_displayport;
+    config_proto_t config_proto;
     crsf_monitor_t crsf;
     crsf_frame_handler_t crsf_cb;
     void *crsf_cb_user;
@@ -823,6 +822,9 @@ static void crsf_monitor_feed(crsf_monitor_t *m, crsf_source_t src, const uint8_
 
 static void crsf_monitor_maybe_report(crsf_monitor_t *m)
 {
+    // If not enabled or verbosity off, skip.
+    // Also, if the parent telemetry monitor has force-set a protocol other than CRSF, we shouldn't be here ideally,
+    // but m->enabled handles that (we init m->crsf with enabled only if PROTO_CRSF).
     if (!m->enabled || !g_verbosity) return;
 
     struct timespec now;
@@ -1005,7 +1007,7 @@ static void telemetry_monitor_init(telemetry_monitor_t *m, bool enabled, config_
 {
     memset(m, 0, sizeof(*m));
     m->enabled = enabled;
-    m->forced_proto = forced_proto;
+    m->config_proto = forced_proto;
     m->crsf_cb = crsf_cb;
     m->crsf_cb_user = crsf_cb_user;
     m->msp_cb = msp_cb;
@@ -1015,7 +1017,7 @@ static void telemetry_monitor_init(telemetry_monitor_t *m, bool enabled, config_
 
 static void telemetry_monitor_set_enabled(telemetry_monitor_t *m, bool enabled, config_proto_t forced_proto)
 {
-    if (m->enabled == enabled && m->forced_proto == forced_proto) return;
+    if (m->enabled == enabled && m->config_proto == forced_proto) return;
     crsf_frame_handler_t crsf_cb = m->crsf_cb;
     void *crsf_user = m->crsf_cb_user;
     msp_frame_handler_t msp_cb = m->msp_cb;
@@ -1104,7 +1106,6 @@ static void telemetry_monitor_feed_msp(telemetry_monitor_t *m, crsf_source_t src
                     if (s->expected >= 6) {
                         uint8_t cmd = s->frame[4];
                         m->msp_type_counts[src][cmd]++;
-                        if (cmd == MSP_DISPLAYPORT) m->detect_displayport = true;
 
                         if (m->msp_cb) {
                             // Frame structure: $ M < len cmd payload... checksum
@@ -1202,109 +1203,13 @@ static void telemetry_monitor_feed(telemetry_monitor_t *m, crsf_source_t src,
 {
     if (!m->enabled) return;
 
-    const char *src_name = (src == CRSF_FROM_UART) ? "uart" : "udp";
     telemetry_proto_t proto = m->protocol[src];
-
-    if (proto == TELEMETRY_PROTO_UNKNOWN) {
-        if (m->forced_proto == PROTO_MSP) {
-            m->protocol[src] = TELEMETRY_PROTO_MSP;
-            proto = TELEMETRY_PROTO_MSP;
-            vlog(2, "telemetry: forced msp parser for %s", src_name);
-        } else if (m->forced_proto == PROTO_CRSF) {
-            m->protocol[src] = TELEMETRY_PROTO_CRSF;
-            proto = TELEMETRY_PROTO_CRSF;
-            vlog(2, "telemetry: forced crsf parser for %s", src_name);
-        } else if (m->forced_proto == PROTO_MAV) {
-            m->protocol[src] = TELEMETRY_PROTO_MAV;
-            proto = TELEMETRY_PROTO_MAV;
-            vlog(2, "telemetry: forced mavlink parser for %s", src_name);
-        }
-    }
-
-    if (proto == TELEMETRY_PROTO_UNKNOWN) {
-        telemetry_proto_t detected = TELEMETRY_PROTO_UNKNOWN;
-
-        uint8_t prev2 = 0, prev1 = 0;
-        if (m->detect_tail_len[src] == 1) {
-            prev1 = m->detect_tail[src][0];
-        } else if (m->detect_tail_len[src] >= 2) {
-            prev2 = m->detect_tail[src][0];
-            prev1 = m->detect_tail[src][1];
-        }
-
-        for (size_t i = 0; i < n && detected == TELEMETRY_PROTO_UNKNOWN; i++) {
-            uint8_t b = data[i];
-            uint8_t next = (i + 1 < n) ? data[i + 1] : 0;
-            uint8_t next2 = (i + 2 < n) ? data[i + 2] : 0;
-
-            if ((prev2 == '$' && prev1 == 'M' && (b == '<' || b == '>')) ||
-                (prev1 == '$' && b == 'M' && (next == '<' || next == '>')) ||
-                (b == '$' && next == 'M' && (next2 == '<' || next2 == '>'))){
-                detected = TELEMETRY_PROTO_MSP;
-                break;
-            }
-
-            if (b == 0xFE || b == 0xFD) {
-                if (i + 1 < n) {
-                    size_t payload_len = next;
-                    size_t expected = (b == 0xFD)
-                        ? (10U + payload_len + 2U + ((i + 2 < n && (next2 & 0x01U)) ? 13U : 0U))
-                        : (6U + payload_len + 2U);
-                    if (expected >= 8 && expected <= sizeof(m->mav_streams[src].frame)) {
-                        detected = TELEMETRY_PROTO_MAV;
-                        break;
-                    }
-                }
-            }
-
-            if (i + 1 < n) {
-                uint8_t len = next;
-                if (len >= 2 && len <= 64) {
-                    detected = TELEMETRY_PROTO_CRSF;
-                }
-            }
-
-            prev2 = prev1;
-            prev1 = b;
-        }
-
-        if (n >= 2) {
-            m->detect_tail[src][0] = data[n - 2];
-            m->detect_tail[src][1] = data[n - 1];
-            m->detect_tail_len[src] = 2;
-        } else if (n == 1) {
-            if (m->detect_tail_len[src] > 0) {
-                m->detect_tail[src][0] = m->detect_tail[src][m->detect_tail_len[src] - 1];
-                m->detect_tail[src][1] = data[0];
-                m->detect_tail_len[src] = 2;
-            } else {
-                m->detect_tail[src][0] = data[0];
-                m->detect_tail_len[src] = 1;
-            }
-        }
-
-        m->undecided_bytes[src] += n;
-        if (detected == TELEMETRY_PROTO_UNKNOWN && m->undecided_bytes[src] > 4096) {
-            detected = TELEMETRY_PROTO_CRSF;
-        }
-
-        if (detected != TELEMETRY_PROTO_UNKNOWN) {
-            m->protocol[src] = detected;
-            m->undecided_bytes[src] = 0;
-            const char *proto_name =
-                (detected == TELEMETRY_PROTO_CRSF) ? "crsf" :
-                (detected == TELEMETRY_PROTO_MSP)  ? "msp"  : "mavlink";
-            vlog(2, "telemetry: locked %s parser for %s", proto_name, src_name);
-        }
-
-        proto = m->protocol[src];
-    }
 
     if (proto == TELEMETRY_PROTO_MSP) {
         telemetry_monitor_feed_msp(m, src, data, n);
     } else if (proto == TELEMETRY_PROTO_MAV) {
         telemetry_monitor_feed_mav(m, src, data, n);
-    } else {
+    } else if (proto == TELEMETRY_PROTO_CRSF) {
         crsf_monitor_feed(&m->crsf, src, data, n);
     }
 }
@@ -1313,7 +1218,10 @@ static void telemetry_monitor_maybe_report(telemetry_monitor_t *m)
 {
     if (!m->enabled || !g_verbosity) return;
 
-    crsf_monitor_maybe_report(&m->crsf);
+    // Report CRSF stats only if configured for CRSF
+    if (m->config_proto == PROTO_CRSF) {
+        crsf_monitor_maybe_report(&m->crsf);
+    }
 
     struct timespec now;
     get_mono(&now);
@@ -1325,19 +1233,22 @@ static void telemetry_monitor_maybe_report(telemetry_monitor_t *m)
     long long elapsed_ms = diff_ms(&now, &m->last_report);
     if (elapsed_ms < 1000) return;
 
-    msp_monitor_print_report(m, elapsed_ms);
-
-    fprintf(stderr,
-            "[telemetry] msp uart=%llu udp=%llu inv=%llu\n"
-            "            mav uart=%llu udp=%llu inv=%llu\n",
+    if (m->config_proto == PROTO_MSP) {
+        msp_monitor_print_report(m, elapsed_ms);
+        fprintf(stderr,
+            "[telemetry] msp uart=%llu udp=%llu inv=%llu\n",
             (unsigned long long)m->msp_frames[CRSF_FROM_UART],
             (unsigned long long)m->msp_frames[CRSF_FROM_UDP],
             (unsigned long long)(m->msp_invalid[CRSF_FROM_UART] +
-                                 m->msp_invalid[CRSF_FROM_UDP]),
+                                 m->msp_invalid[CRSF_FROM_UDP]));
+    } else if (m->config_proto == PROTO_MAV) {
+        fprintf(stderr,
+            "[telemetry] mav uart=%llu udp=%llu inv=%llu\n",
             (unsigned long long)m->mav_frames[CRSF_FROM_UART],
             (unsigned long long)m->mav_frames[CRSF_FROM_UDP],
             (unsigned long long)(m->mav_invalid[CRSF_FROM_UART] +
                                  m->mav_invalid[CRSF_FROM_UDP]));
+    }
 
     m->last_report = now;
     memset(m->msp_frames, 0, sizeof(m->msp_frames));
@@ -1888,6 +1799,19 @@ int main(int argc, char **argv){
     vlog(1, "Loaded config: uart_backend=%s",
          (cfg.uart_backend==UART_TTY?"tty":"stdio"));
 
+    if (cfg.telemetry_proto != PROTO_OFF) {
+        const char *pname = "Unknown";
+        if (cfg.telemetry_proto == PROTO_CRSF) pname = "CRSF";
+        else if (cfg.telemetry_proto == PROTO_MSP) pname = "MSP";
+        else if (cfg.telemetry_proto == PROTO_MAV) pname = "MAVLink";
+
+        vlog(1, "Telemetry enabled: %s (Log: %s, Interval: %dms, Rate: %dHz)",
+             pname, cfg.telemetry_log_enable ? "On" : "Off",
+             cfg.telemetry_log_interval, cfg.telemetry_msp_rate);
+    } else {
+        vlog(1, "Telemetry disabled");
+    }
+
     state_t st; memset(&st,0,sizeof(st));
     st.fd_uart=st.fd_net=-1; st.fd_stdout=-1;
     st.epfd=epoll_create1(0); if(st.epfd<0){ perror("epoll_create1"); return 1; }
@@ -2023,7 +1947,7 @@ int main(int argc, char **argv){
         }
 
         int timeout_ms=500;
-        if (telemetry.detect_displayport || cfg.telemetry_proto == PROTO_MSP) {
+        if (cfg.telemetry_proto == PROTO_MSP) {
             struct timespec now; get_mono(&now);
             long long since_poll = diff_ms(&now, &st.last_msp_poll);
             long long poll_rate = 1000 / cfg.telemetry_msp_rate;
