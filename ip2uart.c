@@ -1980,7 +1980,7 @@ int main(int argc, char **argv){
         }
 
         int timeout_ms=500;
-        if (telemetry.detect_displayport) {
+        if (telemetry.detect_displayport || cfg.msp_parsing) {
             struct timespec now; get_mono(&now);
             long long since_poll = diff_ms(&now, &st.last_msp_poll);
             long long poll_rate = 200; // 5Hz
