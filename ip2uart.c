@@ -93,17 +93,25 @@ static size_t ring_peek(const ringbuf_t *r, const uint8_t **p1, size_t *l1, cons
 static void ring_consume(ringbuf_t *r, size_t n){ if (n>r->len) n=r->len; r->tail=(r->tail+n)%r->cap; r->len-=n; }
 
 /* --------------------------------- Config ----------------------------------- */
+typedef enum {
+    PROTO_OFF = 0,
+    PROTO_AUTO,
+    PROTO_CRSF,
+    PROTO_MSP,
+    PROTO_MAV
+} config_proto_t;
+
 typedef struct {
     // Selectors
     uart_backend_t uart_backend;   // tty | stdio
 
     // Telemetry parsers
-    int  telemetry_detect;         // 0 | 1
-    int  msp_parsing;              // 0 | 1
-    int  crsf_log;                 // 0 | 1
-    char crsf_log_path[256];
-    int  crsf_log_rate_ms;         // >= 0
-    int  crsf_coalesce;            // 0 | 1
+    config_proto_t telemetry_proto; // off|auto|crsf|msp|mavlink
+    int  telemetry_log_enable;      // 0 | 1
+    char telemetry_log_path[256];
+    int  telemetry_log_interval;    // >= 0
+    int  telemetry_crsf_coalesce;   // 0 | 1
+    int  telemetry_msp_rate;        // Hz, default 5
 
     // UART
     char uart_device[128];
@@ -198,12 +206,12 @@ typedef struct {
     uint64_t frames_link_stats;
     uint64_t frames_other;
     struct timespec last_frame;
-} crsf_log_entry_t;
+} telemetry_entry_t;
 
 typedef struct {
     bool enabled;
     struct timespec last_write;
-    crsf_log_entry_t entries[CRSF_SRC_MAX];
+    telemetry_entry_t entries[CRSF_SRC_MAX];
     uint64_t last_pkts_uart_to_net;
     uint64_t last_pkts_net_to_uart;
     struct timespec last_rate;
@@ -211,7 +219,7 @@ typedef struct {
     double rx_pps_hist[5];
     size_t pps_hist_count;
     size_t pps_hist_pos;
-} crsf_log_state_t;
+} telemetry_log_state_t;
 
 #define MSP_STATUS           101
 #define MSP_RAW_GPS          106
@@ -240,7 +248,7 @@ typedef enum {
 
 typedef struct {
     bool enabled;
-    bool force_msp;
+    config_proto_t forced_proto;
     bool detect_displayport;
     crsf_monitor_t crsf;
     crsf_frame_handler_t crsf_cb;
@@ -290,7 +298,7 @@ typedef struct {
 
     // CRSF forwarding
     crsf_stream_t crsf_uart_out;
-    crsf_log_state_t crsf_log;
+    telemetry_log_state_t log_state;
 
     // stats
     uint64_t bytes_uart_to_net, bytes_net_to_uart;
@@ -379,12 +387,12 @@ static int parse_config(const char *path, config_t *cfg){
     memset(cfg,0,sizeof(*cfg));
     // Defaults
     cfg->uart_backend = UART_TTY;
-    cfg->telemetry_detect = 0;
-    cfg->msp_parsing = 0;
-    cfg->crsf_log = 0;
-    strcpy(cfg->crsf_log_path, "/tmp/crsf_log.msg");
-    cfg->crsf_log_rate_ms = 100;
-    cfg->crsf_coalesce = 0;
+    cfg->telemetry_proto = PROTO_OFF;
+    cfg->telemetry_log_enable = 0;
+    strcpy(cfg->telemetry_log_path, "/tmp/crsf_log.msg");
+    cfg->telemetry_log_interval = 100;
+    cfg->telemetry_crsf_coalesce = 0;
+    cfg->telemetry_msp_rate = 5;
 
     strcpy(cfg->uart_device, "/dev/ttyS1");
     cfg->uart_baud=115200; cfg->uart_databits=8; strcpy(cfg->uart_parity,"none"); cfg->uart_stopbits=1; strcpy(cfg->uart_flow,"none");
@@ -432,15 +440,21 @@ static int parse_config(const char *path, config_t *cfg){
 
         else if(!strcmp(key,"rx_buf")) cfg->rx_buf=(size_t)strtoul(val,NULL,10);
         else if(!strcmp(key,"tx_buf")) cfg->tx_buf=(size_t)strtoul(val,NULL,10);
-        else if(!strcmp(key,"telemetry_detect") || !strcmp(key,"crsf_detect")) cfg->telemetry_detect=atoi(val);
-        else if(!strcmp(key,"msp_parsing")) cfg->msp_parsing=atoi(val);
-        else if(!strcmp(key,"crsf_log")) cfg->crsf_log=atoi(val);
-        else if(!strcmp(key,"crsf_log_path")){
-            strncpy(cfg->crsf_log_path, val, sizeof(cfg->crsf_log_path) - 1);
-            cfg->crsf_log_path[sizeof(cfg->crsf_log_path) - 1] = 0;
+        else if(!strcmp(key,"telemetry_proto")){
+            if (!strcmp(val,"auto")) cfg->telemetry_proto=PROTO_AUTO;
+            else if (!strcmp(val,"crsf")) cfg->telemetry_proto=PROTO_CRSF;
+            else if (!strcmp(val,"msp")) cfg->telemetry_proto=PROTO_MSP;
+            else if (!strcmp(val,"mavlink")) cfg->telemetry_proto=PROTO_MAV;
+            else cfg->telemetry_proto=PROTO_OFF;
         }
-        else if(!strcmp(key,"crsf_log_rate_ms")) cfg->crsf_log_rate_ms=atoi(val);
-        else if(!strcmp(key,"crsf_coalesce")) cfg->crsf_coalesce=atoi(val);
+        else if(!strcmp(key,"telemetry_log")) cfg->telemetry_log_enable=atoi(val);
+        else if(!strcmp(key,"telemetry_log_path")){
+            strncpy(cfg->telemetry_log_path, val, sizeof(cfg->telemetry_log_path) - 1);
+            cfg->telemetry_log_path[sizeof(cfg->telemetry_log_path) - 1] = 0;
+        }
+        else if(!strcmp(key,"telemetry_log_interval")) cfg->telemetry_log_interval=atoi(val);
+        else if(!strcmp(key,"telemetry_crsf_coalesce")) cfg->telemetry_crsf_coalesce=atoi(val);
+        else if(!strcmp(key,"telemetry_msp_rate")) cfg->telemetry_msp_rate=atoi(val);
     }
     fclose(f);
 
@@ -450,9 +464,10 @@ static int parse_config(const char *path, config_t *cfg){
     if (cfg->udp_coalesce_idle_ms < 0) cfg->udp_coalesce_idle_ms = 0;
     if (cfg->rx_buf == 0) cfg->rx_buf = 1024;
     if (cfg->tx_buf == 0) cfg->tx_buf = 65536;
-    if (cfg->crsf_log_rate_ms <= 0) cfg->crsf_log_rate_ms = 100;
-    if (!cfg->crsf_log_path[0]) strcpy(cfg->crsf_log_path, "/tmp/crsf_log.msg");
-    cfg->crsf_coalesce = cfg->crsf_coalesce ? 1 : 0;
+    if (cfg->telemetry_log_interval <= 0) cfg->telemetry_log_interval = 100;
+    if (cfg->telemetry_msp_rate <= 0) cfg->telemetry_msp_rate = 1;
+    if (!cfg->telemetry_log_path[0]) strcpy(cfg->telemetry_log_path, "/tmp/crsf_log.msg");
+    cfg->telemetry_crsf_coalesce = cfg->telemetry_crsf_coalesce ? 1 : 0;
 
     return 0;
 }
@@ -963,7 +978,7 @@ static void msp_monitor_print_report(telemetry_monitor_t *m, long long elapsed_m
 }
 
 /* Telemetry monitor wrapper */
-static void telemetry_monitor_init(telemetry_monitor_t *m, bool enabled, bool force_msp,
+static void telemetry_monitor_init(telemetry_monitor_t *m, bool enabled, config_proto_t forced_proto,
                                    crsf_frame_handler_t crsf_cb,
                                    void *crsf_cb_user,
                                    msp_frame_handler_t msp_cb,
@@ -971,7 +986,7 @@ static void telemetry_monitor_init(telemetry_monitor_t *m, bool enabled, bool fo
 {
     memset(m, 0, sizeof(*m));
     m->enabled = enabled;
-    m->force_msp = force_msp;
+    m->forced_proto = forced_proto;
     m->crsf_cb = crsf_cb;
     m->crsf_cb_user = crsf_cb_user;
     m->msp_cb = msp_cb;
@@ -979,14 +994,14 @@ static void telemetry_monitor_init(telemetry_monitor_t *m, bool enabled, bool fo
     crsf_monitor_init(&m->crsf, enabled, crsf_cb, crsf_cb_user);
 }
 
-static void telemetry_monitor_set_enabled(telemetry_monitor_t *m, bool enabled, bool force_msp)
+static void telemetry_monitor_set_enabled(telemetry_monitor_t *m, bool enabled, config_proto_t forced_proto)
 {
-    if (m->enabled == enabled && m->force_msp == force_msp) return;
+    if (m->enabled == enabled && m->forced_proto == forced_proto) return;
     crsf_frame_handler_t crsf_cb = m->crsf_cb;
     void *crsf_user = m->crsf_cb_user;
     msp_frame_handler_t msp_cb = m->msp_cb;
     void *msp_user = m->msp_cb_user;
-    telemetry_monitor_init(m, enabled, force_msp, crsf_cb, crsf_user, msp_cb, msp_user);
+    telemetry_monitor_init(m, enabled, forced_proto, crsf_cb, crsf_user, msp_cb, msp_user);
 }
 
 static void msp_stream_reset(msp_stream_t *s)
@@ -1172,10 +1187,18 @@ static void telemetry_monitor_feed(telemetry_monitor_t *m, crsf_source_t src,
     telemetry_proto_t proto = m->protocol[src];
 
     if (proto == TELEMETRY_PROTO_UNKNOWN) {
-        if (m->force_msp) {
+        if (m->forced_proto == PROTO_MSP) {
             m->protocol[src] = TELEMETRY_PROTO_MSP;
             proto = TELEMETRY_PROTO_MSP;
             vlog(2, "telemetry: forced msp parser for %s", src_name);
+        } else if (m->forced_proto == PROTO_CRSF) {
+            m->protocol[src] = TELEMETRY_PROTO_CRSF;
+            proto = TELEMETRY_PROTO_CRSF;
+            vlog(2, "telemetry: forced crsf parser for %s", src_name);
+        } else if (m->forced_proto == PROTO_MAV) {
+            m->protocol[src] = TELEMETRY_PROTO_MAV;
+            proto = TELEMETRY_PROTO_MAV;
+            vlog(2, "telemetry: forced mavlink parser for %s", src_name);
         }
     }
 
@@ -1307,47 +1330,47 @@ static void telemetry_monitor_maybe_report(telemetry_monitor_t *m)
 /* CRSF logging */
 typedef struct {
     const config_t *cfg;
-    crsf_log_state_t *log;
+    telemetry_log_state_t *log;
     const state_t *st;
-} crsf_log_context_t;
+} telemetry_log_ctx_t;
 
-static void crsf_log_update(const config_t *cfg, crsf_log_state_t *log, const state_t *st,
+static void telemetry_update_crsf(const config_t *cfg, telemetry_log_state_t *log, const state_t *st,
                             crsf_source_t src, uint8_t type, const uint8_t *payload,
                             size_t payload_len);
 
-static void crsf_log_on_frame(crsf_source_t src, uint8_t type, const uint8_t *payload,
+static void telemetry_log_on_crsf_frame(crsf_source_t src, uint8_t type, const uint8_t *payload,
                               size_t payload_len, void *user)
 {
-    crsf_log_context_t *ctx = (crsf_log_context_t *)user;
+    telemetry_log_ctx_t *ctx = (telemetry_log_ctx_t *)user;
     if (!ctx || !ctx->cfg || !ctx->log || !ctx->st) return;
 
-    crsf_log_update(ctx->cfg, ctx->log, ctx->st, src, type, payload, payload_len);
+    telemetry_update_crsf(ctx->cfg, ctx->log, ctx->st, src, type, payload, payload_len);
 }
 
-static void msp_log_update(const config_t *cfg, crsf_log_state_t *log, const state_t *st,
+static void telemetry_update_msp(const config_t *cfg, telemetry_log_state_t *log, const state_t *st,
                            crsf_source_t src, uint8_t cmd, const uint8_t *payload,
                            size_t payload_len);
 
-static void msp_log_on_frame(crsf_source_t src, uint8_t cmd, const uint8_t *payload,
+static void telemetry_log_on_msp_frame(crsf_source_t src, uint8_t cmd, const uint8_t *payload,
                              size_t payload_len, void *user)
 {
-    crsf_log_context_t *ctx = (crsf_log_context_t *)user;
+    telemetry_log_ctx_t *ctx = (telemetry_log_ctx_t *)user;
     if (!ctx || !ctx->cfg || !ctx->log || !ctx->st) return;
 
-    msp_log_update(ctx->cfg, ctx->log, ctx->st, src, cmd, payload, payload_len);
+    telemetry_update_msp(ctx->cfg, ctx->log, ctx->st, src, cmd, payload, payload_len);
 }
 
-static void crsf_log_reset(crsf_log_state_t *log)
+static void telemetry_log_reset(telemetry_log_state_t *log)
 {
     memset(log, 0, sizeof(*log));
 }
 
-static void crsf_log_apply_config(crsf_log_state_t *log, const config_t *cfg)
+static void telemetry_log_init(telemetry_log_state_t *log, const config_t *cfg)
 {
-    bool new_enabled = (cfg->telemetry_detect || cfg->msp_parsing) && cfg->crsf_log && cfg->crsf_log_path[0];
+    bool new_enabled = (cfg->telemetry_proto != PROTO_OFF) && cfg->telemetry_log_enable && cfg->telemetry_log_path[0];
 
     if (!new_enabled) {
-        crsf_log_reset(log);
+        telemetry_log_reset(log);
         return;
     }
 
@@ -1364,7 +1387,7 @@ static const char *crsf_log_prefix(crsf_source_t src)
     return (src == CRSF_FROM_UART) ? "" : "udp_";
 }
 
-static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
+static void telemetry_log_write(const config_t *cfg, telemetry_log_state_t *log,
                                  const state_t *st)
 {
     if (!log->enabled || !st) return;
@@ -1375,7 +1398,7 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
 
     // Maintain flight time state
     for (int i = 0; i < CRSF_SRC_MAX; i++) {
-        crsf_log_entry_t *entry = &log->entries[i];
+        telemetry_entry_t *entry = &log->entries[i];
         if (entry->armed && !entry->prev_armed) {
             entry->armed_start_time = now_s;
         }
@@ -1386,12 +1409,12 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
     }
 
     if (log->last_write.tv_sec || log->last_write.tv_nsec) {
-        if (diff_ms(&now_ts, &log->last_write) < cfg->crsf_log_rate_ms) return;
+        if (diff_ms(&now_ts, &log->last_write) < cfg->telemetry_log_interval) return;
     }
 
-    FILE *f = fopen(cfg->crsf_log_path, "w");
+    FILE *f = fopen(cfg->telemetry_log_path, "w");
     if (!f) {
-        vlog(2, "CRSF log: failed to open %s (%s)", cfg->crsf_log_path, strerror(errno));
+        vlog(2, "CRSF log: failed to open %s (%s)", cfg->telemetry_log_path, strerror(errno));
         return;
     }
 
@@ -1403,7 +1426,7 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
         log->last_pkts_uart_to_net = st->pkts_uart_to_net;
         log->last_pkts_net_to_uart = st->pkts_net_to_uart;
         log->last_rate = now_ts;
-        elapsed_ms = cfg->crsf_log_rate_ms;
+        elapsed_ms = cfg->telemetry_log_interval;
     }
 
     uint64_t delta_tx = st->pkts_uart_to_net - log->last_pkts_uart_to_net;
@@ -1445,7 +1468,7 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
     log->last_rate = now_ts;
 
     for (int i = 0; i < CRSF_SRC_MAX; i++) {
-        const crsf_log_entry_t *entry = &log->entries[i];
+        const telemetry_entry_t *entry = &log->entries[i];
 
         const char *prefix = crsf_log_prefix((crsf_source_t)i);
 
@@ -1548,13 +1571,13 @@ static void crsf_log_maybe_write(const config_t *cfg, crsf_log_state_t *log,
     log->last_write = now_ts;
 }
 
-static void crsf_log_update(const config_t *cfg, crsf_log_state_t *log, const state_t *st,
+static void telemetry_update_crsf(const config_t *cfg, telemetry_log_state_t *log, const state_t *st,
                             crsf_source_t src, uint8_t type, const uint8_t *payload,
                             size_t payload_len)
 {
     if (!log->enabled || src >= CRSF_SRC_MAX) return;
 
-    crsf_log_entry_t *entry = &log->entries[src];
+    telemetry_entry_t *entry = &log->entries[src];
     entry->has_any = true;
     get_mono(&entry->last_frame);
 
@@ -1596,16 +1619,16 @@ static void crsf_log_update(const config_t *cfg, crsf_log_state_t *log, const st
         entry->frames_other++;
     }
 
-    crsf_log_maybe_write(cfg, log, st);
+    telemetry_log_write(cfg, log, st);
 }
 
-static void msp_log_update(const config_t *cfg, crsf_log_state_t *log, const state_t *st,
+static void telemetry_update_msp(const config_t *cfg, telemetry_log_state_t *log, const state_t *st,
                            crsf_source_t src, uint8_t cmd, const uint8_t *payload,
                            size_t payload_len)
 {
     if (!log->enabled || src >= CRSF_SRC_MAX) return;
 
-    crsf_log_entry_t *entry = &log->entries[src];
+    telemetry_entry_t *entry = &log->entries[src];
     entry->has_any = true;
     get_mono(&entry->last_frame);
 
@@ -1693,7 +1716,7 @@ static void msp_log_update(const config_t *cfg, crsf_log_state_t *log, const sta
         entry->frames_other++;
     }
 
-    crsf_log_maybe_write(cfg, log, st);
+    telemetry_log_write(cfg, log, st);
 }
 
 /* CRSF forwarding */
@@ -1727,7 +1750,7 @@ static void crsf_forward_send(const config_t *cfg, state_t *st, const crsf_strea
         return;
     }
 
-    if (cfg->crsf_coalesce) {
+    if (cfg->telemetry_crsf_coalesce) {
         uart_forward_with_coalesce(cfg, st, s->frame, s->len);
         return;
     }
@@ -1849,12 +1872,12 @@ int main(int argc, char **argv){
     st.fd_uart=st.fd_net=-1; st.fd_stdout=-1;
     st.epfd=epoll_create1(0); if(st.epfd<0){ perror("epoll_create1"); return 1; }
 
-    crsf_log_apply_config(&st.crsf_log, &cfg);
+    telemetry_log_init(&st.log_state, &cfg);
 
-    crsf_log_context_t log_ctx = { .cfg = &cfg, .log = &st.crsf_log, .st = &st };
-    bool telemetry_enabled = (cfg.telemetry_detect || cfg.msp_parsing) && (g_verbosity || cfg.crsf_log);
+    telemetry_log_ctx_t log_ctx = { .cfg = &cfg, .log = &st.log_state, .st = &st };
+    bool telemetry_enabled = (cfg.telemetry_proto != PROTO_OFF) && (g_verbosity || cfg.telemetry_log_enable);
     telemetry_monitor_t telemetry;
-    telemetry_monitor_init(&telemetry, telemetry_enabled, cfg.msp_parsing, crsf_log_on_frame, &log_ctx, msp_log_on_frame, &log_ctx);
+    telemetry_monitor_init(&telemetry, telemetry_enabled, cfg.telemetry_proto, telemetry_log_on_crsf_frame, &log_ctx, telemetry_log_on_msp_frame, &log_ctx);
 
     size_t udp_out_cap = cfg.udp_max_datagram>0?(size_t)cfg.udp_max_datagram:1200;
     st.udp_out=(uint8_t*)malloc(udp_out_cap);
@@ -1944,8 +1967,8 @@ int main(int argc, char **argv){
                 cfg = newcfg;
 
                 telemetry_monitor_set_enabled(
-                    &telemetry, (cfg.telemetry_detect || cfg.msp_parsing) && (g_verbosity || cfg.crsf_log), cfg.msp_parsing);
-                crsf_log_apply_config(&st.crsf_log, &cfg);
+                    &telemetry, (cfg.telemetry_proto != PROTO_OFF) && (g_verbosity || cfg.telemetry_log_enable), cfg.telemetry_proto);
+                telemetry_log_init(&st.log_state, &cfg);
 
                 if(rx_resize){
                     free(buf_uart);
@@ -1980,10 +2003,10 @@ int main(int argc, char **argv){
         }
 
         int timeout_ms=500;
-        if (telemetry.detect_displayport || cfg.msp_parsing) {
+        if (telemetry.detect_displayport || cfg.telemetry_proto == PROTO_MSP) {
             struct timespec now; get_mono(&now);
             long long since_poll = diff_ms(&now, &st.last_msp_poll);
-            long long poll_rate = 200; // 5Hz
+            long long poll_rate = 1000 / cfg.telemetry_msp_rate;
             if (since_poll >= poll_rate) {
                 // Time to poll
                 st.last_msp_poll = now;
@@ -2051,7 +2074,7 @@ int main(int argc, char **argv){
             if(fd==st.fd_uart && (ev&EPOLLIN)){
                 ssize_t r=read(st.fd_uart,(void*)buf_uart,cfg.rx_buf);
                 if(r>0){
-                    bool telemetry_mode = cfg.telemetry_detect != 0;
+                    bool telemetry_mode = cfg.telemetry_proto != PROTO_OFF;
 
                     get_mono(&st.last_uart_rx);
                     if (telemetry.enabled) {
@@ -2135,7 +2158,7 @@ int main(int argc, char **argv){
             st.udp_out_len >= (size_t)cfg.udp_coalesce_bytes ? "size_threshold" : "pending");
         maybe_print_stats(&st);
         telemetry_monitor_maybe_report(&telemetry);
-        crsf_log_maybe_write(&cfg, &st.crsf_log, &st);
+        telemetry_log_write(&cfg, &st.log_state, &st);
     }
 
     maybe_print_stats(&st);
