@@ -110,7 +110,7 @@ typedef struct {
     int  telemetry_log_enable;      // 0 | 1
     char telemetry_log_path[256];
     int  telemetry_log_interval;    // >= 0
-    int  telemetry_crsf_coalesce;   // 0 | 1
+    int  telemetry_coalesce;        // 0 | 1
     int  telemetry_msp_rate;        // Hz, default 5
 
     // UART
@@ -391,7 +391,7 @@ static int parse_config(const char *path, config_t *cfg){
     cfg->telemetry_log_enable = 0;
     strcpy(cfg->telemetry_log_path, "/tmp/crsf_log.msg");
     cfg->telemetry_log_interval = 100;
-    cfg->telemetry_crsf_coalesce = 0;
+    cfg->telemetry_coalesce = 0;
     cfg->telemetry_msp_rate = 5;
 
     strcpy(cfg->uart_device, "/dev/ttyS1");
@@ -410,6 +410,10 @@ static int parse_config(const char *path, config_t *cfg){
         char key[MAX_KEY], val[MAX_VAL];
         strncpy(key,line,sizeof(key)-1); key[sizeof(key)-1]=0;
         strncpy(val,eq+1,sizeof(val)-1); val[sizeof(val)-1]=0;
+
+        char *p = val;
+        while(*p){ if(*p=='#' || *p==';'){ *p=0; break; } p++; }
+
         trim(key); trim(val); if(!*key) continue;
 
         if(!strcmp(key,"uart_backend")){
@@ -453,7 +457,7 @@ static int parse_config(const char *path, config_t *cfg){
             cfg->telemetry_log_path[sizeof(cfg->telemetry_log_path) - 1] = 0;
         }
         else if(!strcmp(key,"telemetry_log_interval")) cfg->telemetry_log_interval=atoi(val);
-        else if(!strcmp(key,"telemetry_crsf_coalesce")) cfg->telemetry_crsf_coalesce=atoi(val);
+        else if(!strcmp(key,"telemetry_coalesce")) cfg->telemetry_coalesce=atoi(val);
         else if(!strcmp(key,"telemetry_msp_rate")) cfg->telemetry_msp_rate=atoi(val);
     }
     fclose(f);
@@ -467,7 +471,7 @@ static int parse_config(const char *path, config_t *cfg){
     if (cfg->telemetry_log_interval <= 0) cfg->telemetry_log_interval = 100;
     if (cfg->telemetry_msp_rate <= 0) cfg->telemetry_msp_rate = 1;
     if (!cfg->telemetry_log_path[0]) strcpy(cfg->telemetry_log_path, "/tmp/crsf_log.msg");
-    cfg->telemetry_crsf_coalesce = cfg->telemetry_crsf_coalesce ? 1 : 0;
+    cfg->telemetry_coalesce = cfg->telemetry_coalesce ? 1 : 0;
 
     return 0;
 }
@@ -1750,7 +1754,7 @@ static void crsf_forward_send(const config_t *cfg, state_t *st, const crsf_strea
         return;
     }
 
-    if (cfg->telemetry_crsf_coalesce) {
+    if (cfg->telemetry_coalesce) {
         uart_forward_with_coalesce(cfg, st, s->frame, s->len);
         return;
     }
@@ -1838,7 +1842,8 @@ static void uart_forward_with_coalesce(const config_t *cfg, state_t *st,
         offset += chunk;
     }
 
-    udp_flush_if_ready(cfg, st, false,
+    bool force = (cfg->telemetry_coalesce == 0);
+    udp_flush_if_ready(cfg, st, force,
         st->udp_out_len >= (size_t)cfg->udp_coalesce_bytes ? "size_threshold" : "pending");
 }
 
