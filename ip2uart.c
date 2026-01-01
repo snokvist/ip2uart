@@ -14,6 +14,7 @@
 
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -331,7 +332,14 @@ static void on_sigterm(int sig){ (void)sig; g_stop = 1; }
 
 /* ------------------------------- Utilities ---------------------------------- */
 static int set_nonblock(int fd){ int fl=fcntl(fd,F_GETFL,0); if(fl<0) return -1; return fcntl(fd,F_SETFL,fl|O_NONBLOCK); }
-static void trim(char *s){ if(!s) return; size_t n=strlen(s),i=0,j=n; while(i<n&&(s[i]==' '||s[i]=='\t'||s[i]=='\r'||s[i]=='\n')) i++; while(j>i&&(s[j-1]==' '||s[j-1]=='\t'||s[j-1]=='\r'||s[j-1]=='\n')) j--; if(i>0) memmove(s,s+i,j-i); s[j-i]=0; }
+static void trim(char *s){
+    if(!s) return;
+    size_t n=strlen(s),i=0,j=n;
+    while(i<n && isspace((unsigned char)s[i])) i++;
+    while(j>i && isspace((unsigned char)s[j-1])) j--;
+    if(i>0) memmove(s,s+i,j-i);
+    s[j-i]=0;
+}
 static speed_t baud_to_speed(int baud){
     switch(baud){
         case 9600: return B9600; case 19200: return B19200; case 38400: return B38400;
@@ -588,6 +596,13 @@ static int reopen_everything(const config_t *cfg, state_t *st){
         st->udp_peer.sin_family=AF_INET; st->udp_peer.sin_port=htons(cfg->udp_peer_port);
         if(inet_pton(AF_INET,cfg->udp_peer_addr,&st->udp_peer.sin_addr)==1) st->udp_peer_set=true;
     }
+
+    // Determine actual parity char for logging
+    const char *par = "N";
+    if (!strcmp(cfg->uart_parity, "even")) par = "E";
+    else if (!strcmp(cfg->uart_parity, "odd")) par = "O";
+    // Else it falls back to None, so print N to avoid confusion if parsing failed
+
     vlog(1, "UDP peer: bind %s:%d -> peer %s:%d (coalesce=%dB/%dms, max=%dB)",
          cfg->udp_bind_addr, cfg->udp_bind_port,
          cfg->udp_peer_addr[0]?cfg->udp_peer_addr:"(unset)", cfg->udp_peer_port,
