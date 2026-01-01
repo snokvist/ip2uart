@@ -2025,11 +2025,7 @@ int main(int argc, char **argv){
                         telemetry_monitor_feed(&telemetry, CRSF_FROM_UART, buf_uart, (size_t)r);
                     }
 
-                    telemetry_proto_t uart_proto = telemetry.enabled
-                        ? telemetry.protocol[CRSF_FROM_UART]
-                        : TELEMETRY_PROTO_CRSF;
-                    bool use_crsf_forward = telemetry_mode &&
-                        (!telemetry.enabled || uart_proto == TELEMETRY_PROTO_CRSF);
+                    bool use_crsf_forward = telemetry_mode && (cfg.telemetry_proto == PROTO_CRSF);
 
                     if (use_crsf_forward) {
                         crsf_forward_feed(&cfg, &st, buf_uart, (size_t)r);
