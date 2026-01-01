@@ -99,6 +99,7 @@ typedef struct {
 
     // Telemetry parsers
     int  telemetry_detect;         // 0 | 1
+    int  msp_parsing;              // 0 | 1
     int  crsf_log;                 // 0 | 1
     char crsf_log_path[256];
     int  crsf_log_rate_ms;         // >= 0
@@ -239,6 +240,7 @@ typedef enum {
 
 typedef struct {
     bool enabled;
+    bool force_msp;
     bool detect_displayport;
     crsf_monitor_t crsf;
     crsf_frame_handler_t crsf_cb;
@@ -378,6 +380,7 @@ static int parse_config(const char *path, config_t *cfg){
     // Defaults
     cfg->uart_backend = UART_TTY;
     cfg->telemetry_detect = 0;
+    cfg->msp_parsing = 0;
     cfg->crsf_log = 0;
     strcpy(cfg->crsf_log_path, "/tmp/crsf_log.msg");
     cfg->crsf_log_rate_ms = 100;
@@ -430,6 +433,7 @@ static int parse_config(const char *path, config_t *cfg){
         else if(!strcmp(key,"rx_buf")) cfg->rx_buf=(size_t)strtoul(val,NULL,10);
         else if(!strcmp(key,"tx_buf")) cfg->tx_buf=(size_t)strtoul(val,NULL,10);
         else if(!strcmp(key,"telemetry_detect") || !strcmp(key,"crsf_detect")) cfg->telemetry_detect=atoi(val);
+        else if(!strcmp(key,"msp_parsing")) cfg->msp_parsing=atoi(val);
         else if(!strcmp(key,"crsf_log")) cfg->crsf_log=atoi(val);
         else if(!strcmp(key,"crsf_log_path")){
             strncpy(cfg->crsf_log_path, val, sizeof(cfg->crsf_log_path) - 1);
@@ -959,7 +963,7 @@ static void msp_monitor_print_report(telemetry_monitor_t *m, long long elapsed_m
 }
 
 /* Telemetry monitor wrapper */
-static void telemetry_monitor_init(telemetry_monitor_t *m, bool enabled,
+static void telemetry_monitor_init(telemetry_monitor_t *m, bool enabled, bool force_msp,
                                    crsf_frame_handler_t crsf_cb,
                                    void *crsf_cb_user,
                                    msp_frame_handler_t msp_cb,
@@ -967,6 +971,7 @@ static void telemetry_monitor_init(telemetry_monitor_t *m, bool enabled,
 {
     memset(m, 0, sizeof(*m));
     m->enabled = enabled;
+    m->force_msp = force_msp;
     m->crsf_cb = crsf_cb;
     m->crsf_cb_user = crsf_cb_user;
     m->msp_cb = msp_cb;
@@ -974,14 +979,14 @@ static void telemetry_monitor_init(telemetry_monitor_t *m, bool enabled,
     crsf_monitor_init(&m->crsf, enabled, crsf_cb, crsf_cb_user);
 }
 
-static void telemetry_monitor_set_enabled(telemetry_monitor_t *m, bool enabled)
+static void telemetry_monitor_set_enabled(telemetry_monitor_t *m, bool enabled, bool force_msp)
 {
-    if (m->enabled == enabled) return;
+    if (m->enabled == enabled && m->force_msp == force_msp) return;
     crsf_frame_handler_t crsf_cb = m->crsf_cb;
     void *crsf_user = m->crsf_cb_user;
     msp_frame_handler_t msp_cb = m->msp_cb;
     void *msp_user = m->msp_cb_user;
-    telemetry_monitor_init(m, enabled, crsf_cb, crsf_user, msp_cb, msp_user);
+    telemetry_monitor_init(m, enabled, force_msp, crsf_cb, crsf_user, msp_cb, msp_user);
 }
 
 static void msp_stream_reset(msp_stream_t *s)
@@ -1167,6 +1172,14 @@ static void telemetry_monitor_feed(telemetry_monitor_t *m, crsf_source_t src,
     telemetry_proto_t proto = m->protocol[src];
 
     if (proto == TELEMETRY_PROTO_UNKNOWN) {
+        if (m->force_msp) {
+            m->protocol[src] = TELEMETRY_PROTO_MSP;
+            proto = TELEMETRY_PROTO_MSP;
+            vlog(2, "telemetry: forced msp parser for %s", src_name);
+        }
+    }
+
+    if (proto == TELEMETRY_PROTO_UNKNOWN) {
         telemetry_proto_t detected = TELEMETRY_PROTO_UNKNOWN;
 
         uint8_t prev2 = 0, prev1 = 0;
@@ -1331,7 +1344,7 @@ static void crsf_log_reset(crsf_log_state_t *log)
 
 static void crsf_log_apply_config(crsf_log_state_t *log, const config_t *cfg)
 {
-    bool new_enabled = cfg->telemetry_detect && cfg->crsf_log && cfg->crsf_log_path[0];
+    bool new_enabled = (cfg->telemetry_detect || cfg->msp_parsing) && cfg->crsf_log && cfg->crsf_log_path[0];
 
     if (!new_enabled) {
         crsf_log_reset(log);
@@ -1839,9 +1852,9 @@ int main(int argc, char **argv){
     crsf_log_apply_config(&st.crsf_log, &cfg);
 
     crsf_log_context_t log_ctx = { .cfg = &cfg, .log = &st.crsf_log, .st = &st };
-    bool telemetry_enabled = cfg.telemetry_detect && (g_verbosity || cfg.crsf_log);
+    bool telemetry_enabled = (cfg.telemetry_detect || cfg.msp_parsing) && (g_verbosity || cfg.crsf_log);
     telemetry_monitor_t telemetry;
-    telemetry_monitor_init(&telemetry, telemetry_enabled, crsf_log_on_frame, &log_ctx, msp_log_on_frame, &log_ctx);
+    telemetry_monitor_init(&telemetry, telemetry_enabled, cfg.msp_parsing, crsf_log_on_frame, &log_ctx, msp_log_on_frame, &log_ctx);
 
     size_t udp_out_cap = cfg.udp_max_datagram>0?(size_t)cfg.udp_max_datagram:1200;
     st.udp_out=(uint8_t*)malloc(udp_out_cap);
@@ -1931,7 +1944,7 @@ int main(int argc, char **argv){
                 cfg = newcfg;
 
                 telemetry_monitor_set_enabled(
-                    &telemetry, cfg.telemetry_detect && (g_verbosity || cfg.crsf_log));
+                    &telemetry, (cfg.telemetry_detect || cfg.msp_parsing) && (g_verbosity || cfg.crsf_log), cfg.msp_parsing);
                 crsf_log_apply_config(&st.crsf_log, &cfg);
 
                 if(rx_resize){
