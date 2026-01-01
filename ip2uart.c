@@ -1404,10 +1404,9 @@ static void telemetry_log_write(const config_t *cfg, telemetry_log_state_t *log,
     log->last_pkts_net_to_uart = st->pkts_net_to_uart;
     log->last_rate = now_ts;
 
-    for (int i = 0; i < CRSF_SRC_MAX; i++) {
-        const telemetry_entry_t *entry = &log->entries[i];
-
-        const char *prefix = crsf_log_prefix((crsf_source_t)i);
+    {
+        const telemetry_entry_t *entry = &log->entries[CRSF_FROM_UART];
+        const char *prefix = "";
 
         if (entry->has_battery) {
             fprintf(f, "%svoltage=%.1f\n", prefix, entry->voltage_v);
@@ -1465,11 +1464,11 @@ static void telemetry_log_write(const config_t *cfg, telemetry_log_state_t *log,
 
             unsigned int rssi_pct = (unsigned int)(((float)entry->rssi_raw / 1023.0f) * 100.0f);
             if (rssi_pct > 100) rssi_pct = 100;
-            fprintf(f, "%srssi=%u\n", prefix, rssi_pct);
+            fprintf(f, "%sradio_rssi=%u\n", prefix, rssi_pct);
         } else {
             fprintf(f, "%sarmed=\n", prefix);
             fprintf(f, "%smode_flags=\n", prefix);
-            fprintf(f, "%srssi=\n", prefix);
+            fprintf(f, "%sradio_rssi=\n", prefix);
         }
 
         if (entry->has_home) {
