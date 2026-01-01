@@ -1462,7 +1462,10 @@ static void telemetry_log_write(const config_t *cfg, telemetry_log_state_t *log,
         if (entry->has_status) {
             fprintf(f, "%sarmed=%d\n", prefix, entry->armed);
             fprintf(f, "%smode_flags=0x%08X\n", prefix, entry->flight_mode_flags);
-            fprintf(f, "%srssi=%u\n", prefix, entry->rssi_raw);
+
+            unsigned int rssi_pct = (unsigned int)(((float)entry->rssi_raw / 1023.0f) * 100.0f);
+            if (rssi_pct > 100) rssi_pct = 100;
+            fprintf(f, "%srssi=%u\n", prefix, rssi_pct);
         } else {
             fprintf(f, "%sarmed=\n", prefix);
             fprintf(f, "%smode_flags=\n", prefix);
