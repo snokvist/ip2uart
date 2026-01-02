@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef NLMSG_ALIGNTO
@@ -57,6 +58,83 @@ static inline struct nlattr_min *nla_next(struct nlattr_min *nla, int *rem) {
 }
 
 static uint32_t g_seq = 0;
+
+struct rate_info {
+    bool present;
+    bool have_bitrate;
+    uint32_t bitrate100kbps;
+    int mcs;
+    int width_mhz;
+    bool sgi;
+};
+
+#define MAX_CHAINS 16
+struct chain_signal_info {
+    bool present;
+    int count;
+    int8_t values[MAX_CHAINS];
+};
+
+struct station_info_data {
+    bool have_mac;
+    uint8_t mac[6];
+    char mac_string[18];
+
+    uint64_t rx_bytes;
+    uint64_t tx_bytes;
+    uint32_t rx_pkts;
+    uint32_t tx_pkts;
+    uint32_t tx_retries;
+    uint32_t tx_failed;
+    uint64_t rx_drop_misc;
+    uint64_t fcs_error_count;
+    uint64_t rx_mpdus;
+    uint64_t rx_duration;
+    uint64_t tx_duration;
+    bool have_rx_drop_misc;
+    bool have_fcs_error_count;
+    bool have_rx_mpdus;
+    bool have_rx_duration;
+    bool have_tx_duration;
+
+    bool have_signal;
+    bool have_signal_avg;
+    int8_t signal;
+    int8_t signal_avg;
+
+    struct rate_info tx_rate;
+    struct rate_info rx_rate;
+    struct chain_signal_info chain_sig;
+    struct chain_signal_info chain_sig_avg;
+
+    uint32_t expected_throughput;
+    bool have_expected_throughput;
+};
+
+struct link_score {
+    double score;
+    double retry_ratio;
+    double fail_ratio;
+    double drop_ratio;
+    uint64_t delta_rx_pkts;
+    uint64_t delta_tx_pkts;
+    uint64_t delta_tx_retries;
+    uint64_t delta_tx_failed;
+    uint64_t delta_rx_drop_misc;
+    uint64_t delta_fcs_error_count;
+};
+
+typedef void (*station_info_handler)(const struct station_info_data *, void *);
+
+static double clamp01(double v) {
+    if (v < 0.0) return 0.0;
+    if (v > 1.0) return 1.0;
+    return v;
+}
+
+static uint64_t delta_counter(uint64_t current, uint64_t previous) {
+    return (current >= previous) ? (current - previous) : current;
+}
 
 static int nl_send(int fd, const void *buf, size_t len) {
     struct sockaddr_nl nladdr = { .nl_family = AF_NETLINK };
@@ -202,119 +280,107 @@ static int8_t get_s8(const struct nlattr_min *na) {
     return v;
 }
 
-static void print_rate_info(const struct nlattr_min *rateinfo, const char *label) {
-    // NL80211_ATTR_STA_INFO_{TX,RX}_BITRATE is nested with NL80211_RATE_INFO_*
-    uint32_t bitrate100kbps = 0;
-    bool have_bitrate = false;
+static void fill_rate_info(const struct nlattr_min *rateinfo, struct rate_info *out) {
+    memset(out, 0, sizeof(*out));
+    out->mcs = -1;
+    out->width_mhz = -1;
+    out->present = true;
+
     int rem = NLA_LEN(rateinfo);
     struct nlattr_min *na = (struct nlattr_min *)NLA_DATA(rateinfo);
-
-    int mcs = -1;
-    int width = -1;  // MHz
-    bool sgi = false;
 
     for (; nla_ok(na, rem); na = nla_next(na, &rem)) {
         switch (na->nla_type) {
             case NL80211_RATE_INFO_BITRATE:
                 // usually u16 in units of 100 kbit/s
                 if (NLA_LEN(na) >= 2) {
-                    bitrate100kbps = (uint32_t)get_u16_attr(na);
-                    have_bitrate = true;
+                    out->bitrate100kbps = (uint32_t)get_u16_attr(na);
+                    out->have_bitrate = true;
                 }
                 break;
             case NL80211_RATE_INFO_BITRATE32:
-                bitrate100kbps = get_u32(na);
-                have_bitrate = true;
+                out->bitrate100kbps = get_u32(na);
+                out->have_bitrate = true;
                 break;
             case NL80211_RATE_INFO_MCS:
-                mcs = *(uint8_t *)NLA_DATA(na);
+                out->mcs = *(uint8_t *)NLA_DATA(na);
                 break;
             case NL80211_RATE_INFO_40_MHZ_WIDTH:
-                width = 40;
+                out->width_mhz = 40;
                 break;
             case NL80211_RATE_INFO_80_MHZ_WIDTH:
-                width = 80;
+                out->width_mhz = 80;
                 break;
             case NL80211_RATE_INFO_80P80_MHZ_WIDTH:
-                width = 160; // represent as 160-ish
+                out->width_mhz = 160; // represent as 160-ish
                 break;
             case NL80211_RATE_INFO_160_MHZ_WIDTH:
-                width = 160;
+                out->width_mhz = 160;
                 break;
             case NL80211_RATE_INFO_SHORT_GI:
-                sgi = true;
+                out->sgi = true;
                 break;
             default:
                 break;
         }
     }
+}
 
+static void print_rate_info(const struct rate_info *ri, const char *label) {
     printf("  \"%s\": {", label);
-    if (have_bitrate) {
-        // nl80211 reports bitrate in units of 100 kbit/s
-        double mbps = bitrate100kbps / 10.0;
+    if (ri && ri->have_bitrate) {
+        double mbps = ri->bitrate100kbps / 10.0;
         printf("\"mbps\": %.1f", mbps);
     } else {
         printf("\"mbps\": null");
     }
-    printf(", \"mcs\": %s", (mcs >= 0 ? "" : "null"));
-    if (mcs >= 0) printf("%d", mcs);
 
-    printf(", \"width_mhz\": %s", (width > 0 ? "" : "null"));
-    if (width > 0) printf("%d", width);
+    if (ri && ri->mcs >= 0) printf(", \"mcs\": %d", ri->mcs);
+    else                    printf(", \"mcs\": null");
 
-    printf(", \"sgi\": %s", sgi ? "true" : "false");
+    if (ri && ri->width_mhz > 0) printf(", \"width_mhz\": %d", ri->width_mhz);
+    else                         printf(", \"width_mhz\": null");
+
+    printf(", \"sgi\": %s", (ri && ri->sgi) ? "true" : "false");
     printf("}");
 }
 
-static void print_chain_signal(const struct nlattr_min *chain_attr, const char *label) {
-    // nested: entries of type NL80211_STA_INFO_CHAIN_SIGNAL / AVG:
-    // each child has nla_type = chain index, payload s8 (dBm)
+static void fill_chain_signal(const struct nlattr_min *chain_attr, struct chain_signal_info *out) {
+    memset(out, 0, sizeof(*out));
+    out->present = true;
+
     int rem = NLA_LEN(chain_attr);
     struct nlattr_min *na = (struct nlattr_min *)NLA_DATA(chain_attr);
+    for (; nla_ok(na, rem) && out->count < MAX_CHAINS; na = nla_next(na, &rem)) {
+        out->values[out->count++] = get_s8(na);
+    }
+}
 
+static void print_chain_signal(const struct chain_signal_info *ci, const char *label) {
     printf("  \"%s\": [", label);
-    bool first = true;
-    for (; nla_ok(na, rem); na = nla_next(na, &rem)) {
-        int8_t s = get_s8(na);
-        if (!first) printf(", ");
-        first = false;
-        printf("%d", (int)s);
+    if (ci && ci->present) {
+        for (int i = 0; i < ci->count; i++) {
+            if (i > 0) printf(", ");
+            printf("%d", (int)ci->values[i]);
+        }
     }
     printf("]");
 }
 
-static void handle_station_msg(const struct nlmsghdr *h) {
+static void parse_station_msg(const struct nlmsghdr *h, station_info_handler handler, void *ctx) {
     const struct genlmsghdr *g = (const struct genlmsghdr *)NLMSG_DATA(h);
     int rem = (int)(h->nlmsg_len - NLMSG_HDRLEN - GENL_HDRLEN);
     struct nlattr_min *na = (struct nlattr_min *)((char *)g + GENL_HDRLEN);
 
-    uint8_t mac[6] = {0};
-    bool have_mac = false;
-
-    // station fields
-    uint64_t rx_bytes = 0, tx_bytes = 0;
-    uint32_t rx_pkts = 0, tx_pkts = 0;
-    uint32_t tx_retries = 0, tx_failed = 0;
-    int8_t signal = 0, signal_avg = 0;
-    bool have_signal = false, have_signal_avg = false;
-
-    const struct nlattr_min *tx_rate = NULL;
-    const struct nlattr_min *rx_rate = NULL;
-    const struct nlattr_min *chain_sig = NULL;
-    const struct nlattr_min *chain_sig_avg = NULL;
-
-    uint32_t exp_thr = 0; // often in kbps
-    bool have_exp_thr = false;
-
+    struct station_info_data info = {0};
     const struct nlattr_min *sta_info = NULL;
 
     for (; nla_ok(na, rem); na = nla_next(na, &rem)) {
         switch (na->nla_type) {
             case NL80211_ATTR_MAC:
                 if (NLA_LEN(na) >= 6) {
-                    memcpy(mac, NLA_DATA(na), 6);
-                    have_mac = true;
+                    memcpy(info.mac, NLA_DATA(na), 6);
+                    info.have_mac = true;
                 }
                 break;
             case NL80211_ATTR_STA_INFO:
@@ -330,23 +396,57 @@ static void handle_station_msg(const struct nlmsghdr *h) {
         struct nlattr_min *si = (struct nlattr_min *)NLA_DATA(sta_info);
         for (; nla_ok(si, r2); si = nla_next(si, &r2)) {
             switch (si->nla_type) {
-                case NL80211_STA_INFO_RX_BYTES64: rx_bytes = get_u64(si); break;
-                case NL80211_STA_INFO_TX_BYTES64: tx_bytes = get_u64(si); break;
-                case NL80211_STA_INFO_RX_BYTES:   rx_bytes = get_u32(si); break;
-                case NL80211_STA_INFO_TX_BYTES:   tx_bytes = get_u32(si); break;
-                case NL80211_STA_INFO_RX_PACKETS: rx_pkts = get_u32(si); break;
-                case NL80211_STA_INFO_TX_PACKETS: tx_pkts = get_u32(si); break;
-                case NL80211_STA_INFO_TX_RETRIES: tx_retries = get_u32(si); break;
-                case NL80211_STA_INFO_TX_FAILED:  tx_failed = get_u32(si); break;
-                case NL80211_STA_INFO_SIGNAL:     signal = get_s8(si); have_signal = true; break;
-                case NL80211_STA_INFO_SIGNAL_AVG: signal_avg = get_s8(si); have_signal_avg = true; break;
-                case NL80211_STA_INFO_TX_BITRATE: tx_rate = si; break;
-                case NL80211_STA_INFO_RX_BITRATE: rx_rate = si; break;
-                case NL80211_STA_INFO_CHAIN_SIGNAL: chain_sig = si; break;
-                case NL80211_STA_INFO_CHAIN_SIGNAL_AVG: chain_sig_avg = si; break;
+                case NL80211_STA_INFO_RX_BYTES64: info.rx_bytes = get_u64(si); break;
+                case NL80211_STA_INFO_TX_BYTES64: info.tx_bytes = get_u64(si); break;
+                case NL80211_STA_INFO_RX_BYTES:   info.rx_bytes = get_u32(si); break;
+                case NL80211_STA_INFO_TX_BYTES:   info.tx_bytes = get_u32(si); break;
+                case NL80211_STA_INFO_RX_PACKETS: info.rx_pkts = get_u32(si); break;
+                case NL80211_STA_INFO_TX_PACKETS: info.tx_pkts = get_u32(si); break;
+                case NL80211_STA_INFO_TX_RETRIES: info.tx_retries = get_u32(si); break;
+                case NL80211_STA_INFO_TX_FAILED:  info.tx_failed = get_u32(si); break;
+                case NL80211_STA_INFO_RX_DROP_MISC:
+                    info.rx_drop_misc = get_u64(si);
+                    info.have_rx_drop_misc = true;
+                    break;
+                case NL80211_STA_INFO_FCS_ERROR_COUNT:
+                    info.fcs_error_count = get_u64(si);
+                    info.have_fcs_error_count = true;
+                    break;
+                case NL80211_STA_INFO_RX_MPDUS:
+                    info.rx_mpdus = get_u64(si);
+                    info.have_rx_mpdus = true;
+                    break;
+                case NL80211_STA_INFO_RX_DURATION:
+                    info.rx_duration = get_u64(si);
+                    info.have_rx_duration = true;
+                    break;
+                case NL80211_STA_INFO_TX_DURATION:
+                    info.tx_duration = get_u64(si);
+                    info.have_tx_duration = true;
+                    break;
+                case NL80211_STA_INFO_SIGNAL:
+                    info.signal = get_s8(si);
+                    info.have_signal = true;
+                    break;
+                case NL80211_STA_INFO_SIGNAL_AVG:
+                    info.signal_avg = get_s8(si);
+                    info.have_signal_avg = true;
+                    break;
+                case NL80211_STA_INFO_TX_BITRATE:
+                    fill_rate_info(si, &info.tx_rate);
+                    break;
+                case NL80211_STA_INFO_RX_BITRATE:
+                    fill_rate_info(si, &info.rx_rate);
+                    break;
+                case NL80211_STA_INFO_CHAIN_SIGNAL:
+                    fill_chain_signal(si, &info.chain_sig);
+                    break;
+                case NL80211_STA_INFO_CHAIN_SIGNAL_AVG:
+                    fill_chain_signal(si, &info.chain_sig_avg);
+                    break;
                 case NL80211_STA_INFO_EXPECTED_THROUGHPUT:
-                    exp_thr = get_u32(si);
-                    have_exp_thr = true;
+                    info.expected_throughput = get_u32(si);
+                    info.have_expected_throughput = true;
                     break;
                 default:
                     break;
@@ -354,52 +454,189 @@ static void handle_station_msg(const struct nlmsghdr *h) {
         }
     }
 
-    char macs[18] = "00:00:00:00:00:00";
-    if (have_mac) mac_to_str(mac, macs);
+    strcpy(info.mac_string, "00:00:00:00:00:00");
+    if (info.have_mac) mac_to_str(info.mac, info.mac_string);
 
+    if (handler) handler(&info, ctx);
+}
+
+static void compute_link_score(const struct station_info_data *prev,
+                               const struct station_info_data *cur,
+                               struct link_score *out) {
+    memset(out, 0, sizeof(*out));
+    out->delta_rx_pkts = delta_counter(cur->rx_pkts, prev->rx_pkts);
+    out->delta_tx_pkts = delta_counter(cur->tx_pkts, prev->tx_pkts);
+    out->delta_tx_retries = delta_counter(cur->tx_retries, prev->tx_retries);
+    out->delta_tx_failed = delta_counter(cur->tx_failed, prev->tx_failed);
+    out->delta_rx_drop_misc = delta_counter(cur->rx_drop_misc, prev->rx_drop_misc);
+    out->delta_fcs_error_count =
+        delta_counter(cur->fcs_error_count, prev->fcs_error_count);
+
+    uint64_t tx_denominator = out->delta_tx_pkts + out->delta_tx_retries;
+    uint64_t tx_fail_denominator = out->delta_tx_pkts + out->delta_tx_failed;
+    uint64_t rx_denominator = out->delta_rx_pkts + out->delta_rx_drop_misc +
+                              out->delta_fcs_error_count;
+    uint64_t total_packets = out->delta_tx_pkts + out->delta_rx_pkts;
+
+    out->retry_ratio = tx_denominator ?
+        ((double)out->delta_tx_retries / (double)tx_denominator) : 0.0;
+    out->fail_ratio = tx_fail_denominator ?
+        ((double)out->delta_tx_failed / (double)tx_fail_denominator) : 0.0;
+    out->drop_ratio = rx_denominator ?
+        ((double)(out->delta_rx_drop_misc + out->delta_fcs_error_count) /
+         (double)rx_denominator) : 0.0;
+
+    if (total_packets == 0) {
+        if (out->delta_tx_retries || out->delta_tx_failed ||
+            out->delta_rx_drop_misc || out->delta_fcs_error_count) {
+            out->score = 0.0;
+        } else {
+            out->score = 100.0;
+        }
+        return;
+    }
+
+    double weighted_error = (out->retry_ratio * 0.5) +
+                            (out->fail_ratio * 3.0) +
+                            (out->drop_ratio * 1.5);
+    double penalty = clamp01(weighted_error * 2.0);
+    out->score = (1.0 - penalty) * 100.0;
+}
+
+static void print_station_info(const struct station_info_data *info,
+                               const struct link_score *score) {
     printf("{\n");
-    printf("  \"mac\": \"%s\",\n", macs);
-    printf("  \"rx_bytes\": %" PRIu64 ",\n", (uint64_t)rx_bytes);
-    printf("  \"rx_packets\": %u,\n", rx_pkts);
-    printf("  \"tx_bytes\": %" PRIu64 ",\n", (uint64_t)tx_bytes);
-    printf("  \"tx_packets\": %u,\n", tx_pkts);
-    printf("  \"tx_retries\": %u,\n", tx_retries);
-    printf("  \"tx_failed\": %u,\n", tx_failed);
+    printf("  \"mac\": \"%s\",\n", info->mac_string);
+    printf("  \"rx_bytes\": %" PRIu64 ",\n", (uint64_t)info->rx_bytes);
+    printf("  \"rx_packets\": %u,\n", info->rx_pkts);
+    printf("  \"tx_bytes\": %" PRIu64 ",\n", (uint64_t)info->tx_bytes);
+    printf("  \"tx_packets\": %u,\n", info->tx_pkts);
+    printf("  \"tx_retries\": %u,\n", info->tx_retries);
+    printf("  \"tx_failed\": %u,\n", info->tx_failed);
 
-    if (have_signal)     printf("  \"signal_dbm\": %d,\n", (int)signal);
-    else                 printf("  \"signal_dbm\": null,\n");
-    if (have_signal_avg) printf("  \"signal_avg_dbm\": %d,\n", (int)signal_avg);
-    else                 printf("  \"signal_avg_dbm\": null,\n");
+    if (info->have_rx_drop_misc)
+        printf("  \"rx_drop_misc\": %" PRIu64 ",\n", info->rx_drop_misc);
+    else
+        printf("  \"rx_drop_misc\": null,\n");
 
-    if (chain_sig) {
-        print_chain_signal(chain_sig, "chain_signal_dbm");
+    if (info->have_fcs_error_count)
+        printf("  \"fcs_error_count\": %" PRIu64 ",\n", info->fcs_error_count);
+    else
+        printf("  \"fcs_error_count\": null,\n");
+
+    if (info->have_rx_mpdus)
+        printf("  \"rx_mpdus\": %" PRIu64 ",\n", info->rx_mpdus);
+    else
+        printf("  \"rx_mpdus\": null,\n");
+
+    if (info->have_rx_duration)
+        printf("  \"rx_duration_usecs\": %" PRIu64 ",\n", info->rx_duration);
+    else
+        printf("  \"rx_duration_usecs\": null,\n");
+
+    if (info->have_tx_duration)
+        printf("  \"tx_duration_usecs\": %" PRIu64 ",\n", info->tx_duration);
+    else
+        printf("  \"tx_duration_usecs\": null,\n");
+
+    if (info->have_signal)
+        printf("  \"signal_dbm\": %d,\n", (int)info->signal);
+    else
+        printf("  \"signal_dbm\": null,\n");
+
+    if (info->have_signal_avg)
+        printf("  \"signal_avg_dbm\": %d,\n", (int)info->signal_avg);
+    else
+        printf("  \"signal_avg_dbm\": null,\n");
+
+    if (info->chain_sig.present) {
+        print_chain_signal(&info->chain_sig, "chain_signal_dbm");
         printf(",\n");
     } else {
         printf("  \"chain_signal_dbm\": null,\n");
     }
-    if (chain_sig_avg) {
-        print_chain_signal(chain_sig_avg, "chain_signal_avg_dbm");
+
+    if (info->chain_sig_avg.present) {
+        print_chain_signal(&info->chain_sig_avg, "chain_signal_avg_dbm");
         printf(",\n");
     } else {
         printf("  \"chain_signal_avg_dbm\": null,\n");
     }
 
-    if (tx_rate) { print_rate_info(tx_rate, "tx_rate"); printf(",\n"); }
-    else         { printf("  \"tx_rate\": null,\n"); }
-
-    if (rx_rate) { print_rate_info(rx_rate, "rx_rate"); printf(",\n"); }
-    else         { printf("  \"rx_rate\": null,\n"); }
-
-    if (have_exp_thr) {
-        // In many kernels it's in kbps.
-        printf("  \"expected_throughput_kbps\": %u\n", exp_thr);
+    if (info->tx_rate.present) {
+        print_rate_info(&info->tx_rate, "tx_rate");
+        printf(",\n");
     } else {
-        printf("  \"expected_throughput_kbps\": null\n");
+        printf("  \"tx_rate\": null,\n");
+    }
+
+    if (info->rx_rate.present) {
+        print_rate_info(&info->rx_rate, "rx_rate");
+        printf(",\n");
+    } else {
+        printf("  \"rx_rate\": null,\n");
+    }
+
+    if (info->have_expected_throughput) {
+        printf("  \"expected_throughput_kbps\": %u", info->expected_throughput);
+    } else {
+        printf("  \"expected_throughput_kbps\": null");
+    }
+
+    if (score) {
+        printf(",\n");
+        printf("  \"link_score\": {\n");
+        printf("    \"value\": %.1f,\n", score->score);
+        printf("    \"retry_ratio\": %.4f,\n", score->retry_ratio);
+        printf("    \"fail_ratio\": %.4f,\n", score->fail_ratio);
+        printf("    \"drop_ratio\": %.4f,\n", score->drop_ratio);
+        printf("    \"delta_tx_packets\": %" PRIu64 ",\n", score->delta_tx_pkts);
+        printf("    \"delta_rx_packets\": %" PRIu64 ",\n", score->delta_rx_pkts);
+        printf("    \"delta_tx_retries\": %" PRIu64 ",\n",
+               score->delta_tx_retries);
+        printf("    \"delta_tx_failed\": %" PRIu64 ",\n",
+               score->delta_tx_failed);
+        printf("    \"delta_rx_drop_misc\": %" PRIu64 ",\n",
+               score->delta_rx_drop_misc);
+        printf("    \"delta_fcs_error_count\": %" PRIu64 "\n",
+               score->delta_fcs_error_count);
+        printf("  }\n");
+    } else {
+        printf("\n");
     }
     printf("}\n");
 }
 
-static int nl80211_get_station(int fd, int nl80211_id, int ifindex, const uint8_t *mac_opt /* nullable */) {
+struct capture_ctx {
+    struct station_info_data info;
+    bool seen;
+};
+
+static void print_handler(const struct station_info_data *info, void *ctx) {
+    (void)ctx;
+    print_station_info(info, NULL);
+}
+
+static void capture_handler(const struct station_info_data *info, void *ctx) {
+    struct capture_ctx *c = (struct capture_ctx *)ctx;
+    c->info = *info;
+    c->seen = true;
+}
+
+static void sleep_interval(double seconds) {
+    if (seconds <= 0.0) return;
+    struct timespec ts;
+    ts.tv_sec = (time_t)seconds;
+    ts.tv_nsec = (long)((seconds - (double)ts.tv_sec) * 1e9);
+    nanosleep(&ts, NULL);
+}
+
+static int nl80211_get_station(int fd,
+                               int nl80211_id,
+                               int ifindex,
+                               const uint8_t *mac_opt /* nullable */,
+                               station_info_handler handler,
+                               void *ctx) {
     char buf[8192];
     memset(buf, 0, sizeof(buf));
 
@@ -442,7 +679,7 @@ static int nl80211_get_station(int fd, int nl80211_id, int ifindex, const uint8_
             }
             // Filter to our nl80211 replies (family id)
             if ((int)h->nlmsg_type != nl80211_id) continue;
-            handle_station_msg(h);
+            parse_station_msg(h, handler, ctx);
         }
 
         if (mac_opt) {
@@ -454,11 +691,42 @@ static int nl80211_get_station(int fd, int nl80211_id, int ifindex, const uint8_
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <ifname> [peer-mac]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--watch <seconds>] <ifname> [peer-mac]\n", argv[0]);
         return 2;
     }
 
-    const char *ifname = argv[1];
+    double watch_interval = 0.0;
+    int argi = 1;
+    while (argi < argc && strncmp(argv[argi], "--", 2) == 0) {
+        if (strncmp(argv[argi], "--watch", 7) == 0) {
+            const char *val = NULL;
+            if (argv[argi][7] == '=') {
+                val = argv[argi] + 8;
+            } else if (argi + 1 < argc) {
+                val = argv[++argi];
+            }
+            if (!val) {
+                fprintf(stderr, "--watch requires a numeric interval (seconds)\n");
+                return 2;
+            }
+            watch_interval = strtod(val, NULL);
+            if (watch_interval <= 0.0) {
+                fprintf(stderr, "Invalid watch interval: %s\n", val);
+                return 2;
+            }
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[argi]);
+            return 2;
+        }
+        argi++;
+    }
+
+    if (argc - argi < 1) {
+        fprintf(stderr, "Usage: %s [--watch <seconds>] <ifname> [peer-mac]\n", argv[0]);
+        return 2;
+    }
+
+    const char *ifname = argv[argi++];
     int ifindex = if_nametoindex(ifname);
     if (ifindex <= 0) {
         fprintf(stderr, "if_nametoindex(%s) failed: %s\n", ifname, strerror(errno));
@@ -467,9 +735,9 @@ int main(int argc, char **argv) {
 
     uint8_t mac[6];
     uint8_t *macp = NULL;
-    if (argc >= 3) {
-        if (!parse_mac(argv[2], mac)) {
-            fprintf(stderr, "Invalid MAC: %s\n", argv[2]);
+    if (argi < argc) {
+        if (!parse_mac(argv[argi], mac)) {
+            fprintf(stderr, "Invalid MAC: %s\n", argv[argi]);
             return 2;
         }
         macp = mac;
@@ -496,14 +764,48 @@ int main(int argc, char **argv) {
         close(fd);
         return 1;
     }
+    int rc = 0;
 
-    int rc = nl80211_get_station(fd, nl80211_id, ifindex, macp);
-    if (rc < 0) {
-        fprintf(stderr, "GET_STATION failed: %s\n", strerror(-rc));
-        close(fd);
-        return 1;
+    if (watch_interval > 0.0) {
+        struct capture_ctx ctx = {0};
+        struct station_info_data prev = {0};
+        bool have_prev = false;
+
+        while (true) {
+            memset(&ctx, 0, sizeof(ctx));
+            rc = nl80211_get_station(fd, nl80211_id, ifindex, macp, capture_handler, &ctx);
+            if (rc < 0) {
+                fprintf(stderr, "GET_STATION failed: %s\n", strerror(-rc));
+                break;
+            }
+            if (!ctx.seen) {
+                fprintf(stderr, "No station data received\n");
+                rc = -ENOENT;
+                break;
+            }
+
+            struct link_score score;
+            struct link_score *scorep = NULL;
+            if (have_prev) {
+                compute_link_score(&prev, &ctx.info, &score);
+                scorep = &score;
+            }
+            print_station_info(&ctx.info, scorep);
+            fflush(stdout);
+
+            prev = ctx.info;
+            have_prev = true;
+            sleep_interval(watch_interval);
+        }
+    } else {
+        rc = nl80211_get_station(fd, nl80211_id, ifindex, macp, print_handler, NULL);
+        if (rc < 0) {
+            fprintf(stderr, "GET_STATION failed: %s\n", strerror(-rc));
+            close(fd);
+            return 1;
+        }
     }
 
     close(fd);
-    return 0;
+    return rc ? 1 : 0;
 }
