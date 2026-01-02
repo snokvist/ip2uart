@@ -17,6 +17,7 @@
 #include <linux/nl80211.h>
 #include <net/if.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -96,6 +97,12 @@ struct station_info_data {
     bool have_rx_mpdus;
     bool have_rx_duration;
     bool have_tx_duration;
+    uint64_t rx_duplicates;
+    uint64_t rx_fragments;
+    uint64_t tx_filtered;
+    bool have_rx_duplicates;
+    bool have_rx_fragments;
+    bool have_tx_filtered;
 
     bool have_signal;
     bool have_signal_avg;
@@ -116,12 +123,17 @@ struct link_score {
     double retry_ratio;
     double fail_ratio;
     double drop_ratio;
+    double remote_retry_ratio;
+    double sample_confidence;
     uint64_t delta_rx_pkts;
     uint64_t delta_tx_pkts;
     uint64_t delta_tx_retries;
     uint64_t delta_tx_failed;
     uint64_t delta_rx_drop_misc;
     uint64_t delta_fcs_error_count;
+    uint64_t delta_rx_duplicates;
+    uint64_t delta_rx_fragments;
+    uint64_t delta_tx_filtered;
 };
 
 typedef void (*station_info_handler)(const struct station_info_data *, void *);
@@ -134,6 +146,48 @@ static double clamp01(double v) {
 
 static uint64_t delta_counter(uint64_t current, uint64_t previous) {
     return (current >= previous) ? (current - previous) : current;
+}
+
+static bool read_u64_from_file(const char *path, uint64_t *out) {
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    char buf[64] = {0};
+    if (!fgets(buf, sizeof(buf), f)) {
+        fclose(f);
+        return false;
+    }
+    fclose(f);
+    char *end = NULL;
+    errno = 0;
+    uint64_t v = strtoull(buf, &end, 10);
+    if (errno != 0 || end == buf) return false;
+    *out = v;
+    return true;
+}
+
+static void read_debugfs_stats(const char *dir, struct station_info_data *info) {
+    if (!dir || !info) return;
+
+    char path[PATH_MAX];
+    uint64_t v = 0;
+
+    int n = snprintf(path, sizeof(path), "%s/rx_duplicates", dir);
+    if (n > 0 && n < (int)sizeof(path) && read_u64_from_file(path, &v)) {
+        info->rx_duplicates = v;
+        info->have_rx_duplicates = true;
+    }
+
+    n = snprintf(path, sizeof(path), "%s/rx_fragments", dir);
+    if (n > 0 && n < (int)sizeof(path) && read_u64_from_file(path, &v)) {
+        info->rx_fragments = v;
+        info->have_rx_fragments = true;
+    }
+
+    n = snprintf(path, sizeof(path), "%s/tx_filtered", dir);
+    if (n > 0 && n < (int)sizeof(path) && read_u64_from_file(path, &v)) {
+        info->tx_filtered = v;
+        info->have_tx_filtered = true;
+    }
 }
 
 static int nl_send(int fd, const void *buf, size_t len) {
@@ -170,30 +224,8 @@ static int nla_put(void *msgbuf, size_t msgbuf_sz, size_t *off, uint16_t type, c
 static int nla_put_u32(void *msgbuf, size_t msgbuf_sz, size_t *off, uint16_t type, uint32_t v) {
     return nla_put(msgbuf, msgbuf_sz, off, type, &v, sizeof(v));
 }
-static int nla_put_u16(void *msgbuf, size_t msgbuf_sz, size_t *off, uint16_t type, uint16_t v) {
-    return nla_put(msgbuf, msgbuf_sz, off, type, &v, sizeof(v));
-}
-static int nla_put_u8(void *msgbuf, size_t msgbuf_sz, size_t *off, uint16_t type, uint8_t v) {
-    return nla_put(msgbuf, msgbuf_sz, off, type, &v, sizeof(v));
-}
 static int nla_put_string(void *msgbuf, size_t msgbuf_sz, size_t *off, uint16_t type, const char *s) {
     return nla_put(msgbuf, msgbuf_sz, off, type, s, (uint16_t)(strlen(s) + 1));
-}
-
-static int nla_nest_start(void *msgbuf, size_t msgbuf_sz, size_t *off, uint16_t type, size_t *nest_off_out) {
-    // Create an attribute with no payload yet; fill length later.
-    if (*off + NLA_ALIGN(NLA_HDRLEN) > msgbuf_sz) return -ENOBUFS;
-    *nest_off_out = *off;
-    struct nlattr_min *na = (struct nlattr_min *)((char *)msgbuf + *off);
-    na->nla_type = type;
-    na->nla_len  = (uint16_t)NLA_HDRLEN;
-    *off += NLA_ALIGN(NLA_HDRLEN);
-    return 0;
-}
-static void nla_nest_end(void *msgbuf, size_t *off, size_t nest_off) {
-    struct nlattr_min *na = (struct nlattr_min *)((char *)msgbuf + nest_off);
-    na->nla_len = (uint16_t)(*off - nest_off);
-    // (already aligned by caller usage)
 }
 
 static bool parse_mac(const char *s, uint8_t mac[6]) {
@@ -471,12 +503,20 @@ static void compute_link_score(const struct station_info_data *prev,
     out->delta_rx_drop_misc = delta_counter(cur->rx_drop_misc, prev->rx_drop_misc);
     out->delta_fcs_error_count =
         delta_counter(cur->fcs_error_count, prev->fcs_error_count);
+    out->delta_rx_duplicates =
+        delta_counter(cur->rx_duplicates, prev->rx_duplicates);
+    out->delta_rx_fragments =
+        delta_counter(cur->rx_fragments, prev->rx_fragments);
+    out->delta_tx_filtered =
+        delta_counter(cur->tx_filtered, prev->tx_filtered);
 
     uint64_t tx_denominator = out->delta_tx_pkts + out->delta_tx_retries;
     uint64_t tx_fail_denominator = out->delta_tx_pkts + out->delta_tx_failed;
     uint64_t rx_denominator = out->delta_rx_pkts + out->delta_rx_drop_misc +
                               out->delta_fcs_error_count;
     uint64_t total_packets = out->delta_tx_pkts + out->delta_rx_pkts;
+    uint64_t remote_retry_denominator =
+        out->delta_rx_pkts + out->delta_rx_duplicates;
 
     out->retry_ratio = tx_denominator ?
         ((double)out->delta_tx_retries / (double)tx_denominator) : 0.0;
@@ -485,10 +525,16 @@ static void compute_link_score(const struct station_info_data *prev,
     out->drop_ratio = rx_denominator ?
         ((double)(out->delta_rx_drop_misc + out->delta_fcs_error_count) /
          (double)rx_denominator) : 0.0;
+    out->remote_retry_ratio = remote_retry_denominator ?
+        ((double)out->delta_rx_duplicates / (double)remote_retry_denominator) :
+        0.0;
+
+    out->sample_confidence = clamp01((double)total_packets / 100.0);
 
     if (total_packets == 0) {
         if (out->delta_tx_retries || out->delta_tx_failed ||
-            out->delta_rx_drop_misc || out->delta_fcs_error_count) {
+            out->delta_rx_drop_misc || out->delta_fcs_error_count ||
+            out->delta_rx_duplicates) {
             out->score = 0.0;
         } else {
             out->score = 100.0;
@@ -498,8 +544,9 @@ static void compute_link_score(const struct station_info_data *prev,
 
     double weighted_error = (out->retry_ratio * 0.5) +
                             (out->fail_ratio * 3.0) +
-                            (out->drop_ratio * 1.5);
-    double penalty = clamp01(weighted_error * 2.0);
+                            (out->drop_ratio * 1.5) +
+                            (out->remote_retry_ratio * 1.0);
+    double penalty = clamp01(weighted_error * 2.0 * out->sample_confidence);
     out->score = (1.0 - penalty) * 100.0;
 }
 
@@ -538,6 +585,21 @@ static void print_station_info(const struct station_info_data *info,
         printf("  \"tx_duration_usecs\": %" PRIu64 ",\n", info->tx_duration);
     else
         printf("  \"tx_duration_usecs\": null,\n");
+
+    if (info->have_rx_duplicates)
+        printf("  \"rx_duplicates\": %" PRIu64 ",\n", info->rx_duplicates);
+    else
+        printf("  \"rx_duplicates\": null,\n");
+
+    if (info->have_rx_fragments)
+        printf("  \"rx_fragments\": %" PRIu64 ",\n", info->rx_fragments);
+    else
+        printf("  \"rx_fragments\": null,\n");
+
+    if (info->have_tx_filtered)
+        printf("  \"tx_filtered\": %" PRIu64 ",\n", info->tx_filtered);
+    else
+        printf("  \"tx_filtered\": null,\n");
 
     if (info->have_signal)
         printf("  \"signal_dbm\": %d,\n", (int)info->signal);
@@ -590,6 +652,9 @@ static void print_station_info(const struct station_info_data *info,
         printf("    \"retry_ratio\": %.4f,\n", score->retry_ratio);
         printf("    \"fail_ratio\": %.4f,\n", score->fail_ratio);
         printf("    \"drop_ratio\": %.4f,\n", score->drop_ratio);
+        printf("    \"remote_retry_ratio\": %.4f,\n",
+               score->remote_retry_ratio);
+        printf("    \"sample_confidence\": %.2f,\n", score->sample_confidence);
         printf("    \"delta_tx_packets\": %" PRIu64 ",\n", score->delta_tx_pkts);
         printf("    \"delta_rx_packets\": %" PRIu64 ",\n", score->delta_rx_pkts);
         printf("    \"delta_tx_retries\": %" PRIu64 ",\n",
@@ -598,8 +663,14 @@ static void print_station_info(const struct station_info_data *info,
                score->delta_tx_failed);
         printf("    \"delta_rx_drop_misc\": %" PRIu64 ",\n",
                score->delta_rx_drop_misc);
-        printf("    \"delta_fcs_error_count\": %" PRIu64 "\n",
+        printf("    \"delta_fcs_error_count\": %" PRIu64 ",\n",
                score->delta_fcs_error_count);
+        printf("    \"delta_rx_duplicates\": %" PRIu64 ",\n",
+               score->delta_rx_duplicates);
+        printf("    \"delta_rx_fragments\": %" PRIu64 ",\n",
+               score->delta_rx_fragments);
+        printf("    \"delta_tx_filtered\": %" PRIu64 "\n",
+               score->delta_tx_filtered);
         printf("  }\n");
     } else {
         printf("\n");
@@ -611,11 +682,6 @@ struct capture_ctx {
     struct station_info_data info;
     bool seen;
 };
-
-static void print_handler(const struct station_info_data *info, void *ctx) {
-    (void)ctx;
-    print_station_info(info, NULL);
-}
 
 static void capture_handler(const struct station_info_data *info, void *ctx) {
     struct capture_ctx *c = (struct capture_ctx *)ctx;
@@ -691,11 +757,13 @@ static int nl80211_get_station(int fd,
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s [--watch <seconds>] <ifname> [peer-mac]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--watch <seconds>] [--json] [--debugfs <dir>] <ifname> [peer-mac]\n", argv[0]);
         return 2;
     }
 
     double watch_interval = 0.0;
+    bool json_output = false;
+    const char *debugfs_dir = NULL;
     int argi = 1;
     while (argi < argc && strncmp(argv[argi], "--", 2) == 0) {
         if (strncmp(argv[argi], "--watch", 7) == 0) {
@@ -714,6 +782,14 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Invalid watch interval: %s\n", val);
                 return 2;
             }
+        } else if (strcmp(argv[argi], "--json") == 0) {
+            json_output = true;
+        } else if (strcmp(argv[argi], "--debugfs") == 0) {
+            if (argi + 1 >= argc) {
+                fprintf(stderr, "--debugfs requires a directory path\n");
+                return 2;
+            }
+            debugfs_dir = argv[++argi];
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[argi]);
             return 2;
@@ -722,7 +798,7 @@ int main(int argc, char **argv) {
     }
 
     if (argc - argi < 1) {
-        fprintf(stderr, "Usage: %s [--watch <seconds>] <ifname> [peer-mac]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--watch <seconds>] [--json] [--debugfs <dir>] <ifname> [peer-mac]\n", argv[0]);
         return 2;
     }
 
@@ -784,13 +860,31 @@ int main(int argc, char **argv) {
                 break;
             }
 
+            if (debugfs_dir) {
+                read_debugfs_stats(debugfs_dir, &ctx.info);
+            }
+
             struct link_score score;
             struct link_score *scorep = NULL;
             if (have_prev) {
                 compute_link_score(&prev, &ctx.info, &score);
                 scorep = &score;
             }
-            print_station_info(&ctx.info, scorep);
+
+            if (json_output) {
+                print_station_info(&ctx.info, scorep);
+            } else {
+                if (scorep) {
+                    printf("score=%.1f retry=%.4f fail=%.4f drop=%.4f remote_retry=%.4f conf=%.2f "
+                           "tx=%" PRIu64 " rx=%" PRIu64 "\n",
+                           scorep->score, scorep->retry_ratio, scorep->fail_ratio,
+                           scorep->drop_ratio, scorep->remote_retry_ratio,
+                           scorep->sample_confidence, scorep->delta_tx_pkts,
+                           scorep->delta_rx_pkts);
+                } else {
+                    printf("score=-- (priming)\n");
+                }
+            }
             fflush(stdout);
 
             prev = ctx.info;
@@ -798,12 +892,22 @@ int main(int argc, char **argv) {
             sleep_interval(watch_interval);
         }
     } else {
-        rc = nl80211_get_station(fd, nl80211_id, ifindex, macp, print_handler, NULL);
+        struct capture_ctx ctx = {0};
+        rc = nl80211_get_station(fd, nl80211_id, ifindex, macp, capture_handler, &ctx);
         if (rc < 0) {
             fprintf(stderr, "GET_STATION failed: %s\n", strerror(-rc));
             close(fd);
             return 1;
         }
+        if (!ctx.seen) {
+            fprintf(stderr, "No station data received\n");
+            close(fd);
+            return 1;
+        }
+        if (debugfs_dir) {
+            read_debugfs_stats(debugfs_dir, &ctx.info);
+        }
+        print_station_info(&ctx.info, NULL);
     }
 
     close(fd);
