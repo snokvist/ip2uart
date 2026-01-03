@@ -120,6 +120,7 @@ struct station_info_data {
 
 struct link_score {
     double score;
+    double smoothed_score;
     double retry_ratio;
     double fail_ratio;
     double drop_ratio;
@@ -548,6 +549,7 @@ static void compute_link_score(const struct station_info_data *prev,
                             (out->remote_retry_ratio * 1.0);
     double penalty = clamp01(weighted_error * 2.0 * out->sample_confidence);
     out->score = (1.0 - penalty) * 100.0;
+    out->smoothed_score = out->score;
 }
 
 static void print_station_info(const struct station_info_data *info,
@@ -654,6 +656,7 @@ static void print_station_info(const struct station_info_data *info,
         printf("    \"drop_ratio\": %.4f,\n", score->drop_ratio);
         printf("    \"remote_retry_ratio\": %.4f,\n",
                score->remote_retry_ratio);
+        printf("    \"smoothed_value\": %.1f,\n", score->smoothed_score);
         printf("    \"sample_confidence\": %.2f,\n", score->sample_confidence);
         printf("    \"delta_tx_packets\": %" PRIu64 ",\n", score->delta_tx_pkts);
         printf("    \"delta_rx_packets\": %" PRIu64 ",\n", score->delta_rx_pkts);
@@ -846,6 +849,10 @@ int main(int argc, char **argv) {
         struct capture_ctx ctx = {0};
         struct station_info_data prev = {0};
         bool have_prev = false;
+        double score_window[3] = {0.0, 0.0, 0.0};
+        int score_count = 0;
+        int score_pos = 0;
+        double score_sum = 0.0;
 
         while (true) {
             memset(&ctx, 0, sizeof(ctx));
@@ -868,6 +875,17 @@ int main(int argc, char **argv) {
             struct link_score *scorep = NULL;
             if (have_prev) {
                 compute_link_score(&prev, &ctx.info, &score);
+                double raw = score.score;
+                if (score_count < 3) {
+                    score_window[score_count++] = raw;
+                    score_sum += raw;
+                } else {
+                    score_sum -= score_window[score_pos];
+                    score_window[score_pos] = raw;
+                    score_sum += raw;
+                    score_pos = (score_pos + 1) % 3;
+                }
+                score.smoothed_score = score_sum / (double)score_count;
                 scorep = &score;
             }
 
@@ -875,9 +893,10 @@ int main(int argc, char **argv) {
                 print_station_info(&ctx.info, scorep);
             } else {
                 if (scorep) {
-                    printf("score=%.1f retry=%.4f fail=%.4f drop=%.4f remote_retry=%.4f conf=%.2f "
+                    printf("score=%.1f avg3=%.1f retry=%.4f fail=%.4f drop=%.4f remote_retry=%.4f conf=%.2f "
                            "tx=%" PRIu64 " rx=%" PRIu64 "\n",
-                           scorep->score, scorep->retry_ratio, scorep->fail_ratio,
+                           scorep->score, scorep->smoothed_score,
+                           scorep->retry_ratio, scorep->fail_ratio,
                            scorep->drop_ratio, scorep->remote_retry_ratio,
                            scorep->sample_confidence, scorep->delta_tx_pkts,
                            scorep->delta_rx_pkts);
