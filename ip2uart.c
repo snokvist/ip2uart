@@ -1,5 +1,5 @@
-// ip2uart.c — TTY/STDIO <-> UDP bridge for embedded Linux
-// - UART side selectable: uart_backend=tty | stdio
+// ip2uart.c — UART(TTY) <-> UDP bridge for embedded Linux
+// - UART side uses serial TTY device
 // - UDP: static peer (fire-and-forget), accepts from any sender
 // - UDP coalescing: size threshold + short idle before send
 // - Short-write safe: ring buffers for both directions (non-blocking)
@@ -42,8 +42,9 @@
 #define MAX_KEY      64
 #define MAX_VAL      256
 #define MAX_EVENTS   18
+#define REOPEN_RETRY_MS 10000
 
-typedef enum { UART_TTY, UART_STDIO } uart_backend_t;
+typedef enum { UART_TTY } uart_backend_t;
 
 /* ----------------------------- Verbose logging ------------------------------ */
 static int g_verbosity = 0;
@@ -103,13 +104,10 @@ typedef enum {
 
 typedef struct {
     // Selectors
-    uart_backend_t uart_backend;   // tty | stdio
+    uart_backend_t uart_backend;   // tty
 
     // Telemetry parsers
     config_proto_t telemetry_proto; // off|auto|crsf|msp|mavlink
-    int  telemetry_log_enable;      // 0 | 1
-    char telemetry_log_path[256];
-    int  telemetry_log_interval;    // >= 0
     int  telemetry_coalesce;        // 0 | 1
     int  telemetry_msp_rate;        // Hz, default 5
 
@@ -162,65 +160,6 @@ typedef struct {
     void *on_frame_user;
 } crsf_monitor_t;
 
-typedef struct {
-    bool has_battery;
-    bool has_gps;
-    bool has_status;
-    bool has_baro;
-    bool has_home;
-    bool has_any;
-
-    double voltage_v;
-    double current_raw;
-    uint32_t capacity_mah;
-    uint8_t remaining_pct;
-
-    double latitude_deg;
-    double longitude_deg;
-    double groundspeed_raw;
-    double heading_deg;
-    double altitude_m;
-    uint8_t sats;
-
-    bool armed;
-    bool has_attitude;
-    uint32_t flight_mode_flags;
-    uint16_t rssi_raw;
-
-    double roll_deg;
-    double pitch_deg;
-
-    double baro_altitude_m;
-    double vario_m_s;
-
-    double home_dist_m;
-    double home_dir_deg;
-
-    bool prev_armed;
-    double armed_start_time;
-    double armed_accumulated_s;
-
-    uint64_t frames_rc;
-    uint64_t frames_gps;
-    uint64_t frames_battery;
-    uint64_t frames_link_stats;
-    uint64_t frames_other;
-    struct timespec last_frame;
-} telemetry_entry_t;
-
-typedef struct {
-    bool enabled;
-    struct timespec last_write;
-    telemetry_entry_t entries[CRSF_SRC_MAX];
-    uint64_t last_pkts_uart_to_net;
-    uint64_t last_pkts_net_to_uart;
-    struct timespec last_rate;
-    double tx_pps_hist[5];
-    double rx_pps_hist[5];
-    size_t pps_hist_count;
-    size_t pps_hist_pos;
-} telemetry_log_state_t;
-
 #define MSP_STATUS           101
 #define MSP_RAW_GPS          106
 #define MSP_COMP_GPS         107
@@ -230,10 +169,6 @@ typedef struct {
 #define MSP_BATTERY_STATE    130
 #define MSP_STATUS_EX        150
 #define MSP_DISPLAYPORT      182
-
-typedef void (*msp_frame_handler_t)(crsf_source_t src, uint8_t cmd,
-                                    const uint8_t *payload, size_t payload_len,
-                                    void *user);
 
 typedef struct { uint8_t frame[300]; size_t len; size_t expected; } msp_stream_t;
 
@@ -250,11 +185,6 @@ typedef struct {
     bool enabled;
     config_proto_t config_proto;
     crsf_monitor_t crsf;
-    crsf_frame_handler_t crsf_cb;
-    void *crsf_cb_user;
-
-    msp_frame_handler_t msp_cb;
-    void *msp_cb_user;
 
     telemetry_proto_t protocol[CRSF_SRC_MAX];
 
@@ -273,12 +203,9 @@ typedef struct {
 /* --------------------------------- State ------------------------------------ */
 typedef struct {
     // fds
-    int fd_uart;     // UART or STDIN
-    int fd_stdout;   // only used when uart_backend=STDIO, else -1
+    int fd_uart;     // UART
     int fd_net;      // UDP socket
     int epfd;
-
-    bool stdout_registered;
 
     // UDP peer (static outbound)
     struct sockaddr_in udp_peer;
@@ -293,7 +220,6 @@ typedef struct {
 
     // CRSF forwarding
     crsf_stream_t crsf_uart_out;
-    telemetry_log_state_t log_state;
 
     // stats
     uint64_t bytes_uart_to_net, bytes_net_to_uart;
@@ -310,7 +236,7 @@ typedef struct {
     uint64_t last_report_bytes_net_to_uart;
 
     // rings for short-write safety
-    ringbuf_t uart_out;  // NET -> UART/STDOUT pending bytes
+    ringbuf_t uart_out;  // NET -> UART pending bytes
 
     bool running;
 } state_t;
@@ -318,6 +244,7 @@ typedef struct {
 /* Forward declarations */
 static void uart_forward_with_coalesce(const config_t *cfg, state_t *st,
                                        const uint8_t *data, size_t n);
+static void crsf_stream_reset(crsf_stream_t *s);
 
 /* ------------------------------- Signals ------------------------------------ */
 static volatile sig_atomic_t g_reload = 0, g_stop = 0;
@@ -368,6 +295,14 @@ static int set_custom_baud(int fd, int baud){
 }
 static void get_mono(struct timespec *ts){ clock_gettime(CLOCK_MONOTONIC, ts); }
 static long long diff_ms(const struct timespec *a, const struct timespec *b){ return (a->tv_sec-b->tv_sec)*1000LL + (a->tv_nsec-b->tv_nsec)/1000000LL; }
+static void add_ms(struct timespec *ts, long long ms){
+    ts->tv_sec += ms / 1000;
+    ts->tv_nsec += (ms % 1000) * 1000000LL;
+    if (ts->tv_nsec >= 1000000000L) {
+        ts->tv_sec += 1;
+        ts->tv_nsec -= 1000000000L;
+    }
+}
 
 static uint8_t crc8_d5(const uint8_t *d, size_t n)
 {
@@ -390,9 +325,6 @@ static int parse_config(const char *path, config_t *cfg){
     // Defaults
     cfg->uart_backend = UART_TTY;
     cfg->telemetry_proto = PROTO_OFF;
-    cfg->telemetry_log_enable = 0;
-    strcpy(cfg->telemetry_log_path, "/tmp/crsf_log.msg");
-    cfg->telemetry_log_interval = 100;
     cfg->telemetry_coalesce = 0;
     cfg->telemetry_msp_rate = 5;
 
@@ -421,8 +353,7 @@ static int parse_config(const char *path, config_t *cfg){
         vlog(1, "Parsed: %s = %s", key, val);
 
         if(!strcmp(key,"uart_backend")){
-            if(!strcmp(val,"tty")) cfg->uart_backend=UART_TTY;
-            else if(!strcmp(val,"stdio")) cfg->uart_backend=UART_STDIO;
+            cfg->uart_backend=UART_TTY;
         } else if(!strcmp(key,"net_mode")){
             if(strcmp(val,"udp_peer")){
                 fclose(f);
@@ -454,12 +385,6 @@ static int parse_config(const char *path, config_t *cfg){
             else if (!strcmp(val,"mavlink")) cfg->telemetry_proto=PROTO_MAV;
             else cfg->telemetry_proto=PROTO_OFF;
         }
-        else if(!strcmp(key,"telemetry_log")) cfg->telemetry_log_enable=atoi(val);
-        else if(!strcmp(key,"telemetry_log_path")){
-            strncpy(cfg->telemetry_log_path, val, sizeof(cfg->telemetry_log_path) - 1);
-            cfg->telemetry_log_path[sizeof(cfg->telemetry_log_path) - 1] = 0;
-        }
-        else if(!strcmp(key,"telemetry_log_interval")) cfg->telemetry_log_interval=atoi(val);
         else if(!strcmp(key,"telemetry_coalesce")) cfg->telemetry_coalesce=atoi(val);
         else if(!strcmp(key,"telemetry_msp_rate")) cfg->telemetry_msp_rate=atoi(val);
     }
@@ -471,9 +396,7 @@ static int parse_config(const char *path, config_t *cfg){
     if (cfg->udp_coalesce_idle_ms < 0) cfg->udp_coalesce_idle_ms = 0;
     if (cfg->rx_buf == 0) cfg->rx_buf = 1024;
     if (cfg->tx_buf == 0) cfg->tx_buf = 65536;
-    if (cfg->telemetry_log_interval <= 0) cfg->telemetry_log_interval = 100;
     if (cfg->telemetry_msp_rate <= 0) cfg->telemetry_msp_rate = 1;
-    if (!cfg->telemetry_log_path[0]) strcpy(cfg->telemetry_log_path, "/tmp/crsf_log.msg");
     cfg->telemetry_coalesce = cfg->telemetry_coalesce ? 1 : 0;
 
     return 0;
@@ -551,52 +474,86 @@ static ssize_t write_from_ring_fd(int fd, ringbuf_t *r){
 /* ------------------------ Open/close based on config ------------------------ */
 static int reopen_everything(const config_t *cfg, state_t *st){
     vlog(2, "Reopen: closing existing fds");
-    if (st->fd_net    >=0){ del_ep(st->epfd,st->fd_net);    close_fd(&st->fd_net); }
-    if (cfg->uart_backend==UART_TTY && st->fd_uart>=0){ del_ep(st->epfd,st->fd_uart); close_fd(&st->fd_uart); }
-    if (st->fd_stdout>=0 && st->stdout_registered){ del_ep(st->epfd,st->fd_stdout); st->stdout_registered=false; }
-    st->fd_stdout=-1;
+    if (st->fd_net >= 0) {
+        del_ep(st->epfd, st->fd_net);
+        close_fd(&st->fd_net);
+    }
+    if (st->fd_uart >= 0) {
+        del_ep(st->epfd, st->fd_uart);
+        close_fd(&st->fd_uart);
+    }
 
-    st->udp_peer_set=false;
-    st->udp_out_len=0;
-    st->udp_wait_writable=false;
+    st->udp_peer_set = false;
+    st->udp_out_len = 0;
+    st->udp_wait_writable = false;
 
     ring_free(&st->uart_out);
-    if(ring_init(&st->uart_out,cfg->tx_buf)<0){
+    if (ring_init(&st->uart_out, cfg->tx_buf) < 0) {
         vlog(1, "ring buffer allocation failed (%s)", strerror(errno));
         return -1;
     }
 
-    // UART / STDIO
-    if (cfg->uart_backend==UART_STDIO){
-        st->fd_uart=STDIN_FILENO; st->fd_stdout=STDOUT_FILENO;
-        set_nonblock(st->fd_uart); set_nonblock(st->fd_stdout);
-        setvbuf(stdout,NULL,_IONBF,0);
-        add_ep(st->epfd, st->fd_uart, EPOLLIN);
-        vlog(1, "UART backend: stdio (stdin/stdout)");
-    } else {
-        st->fd_uart = open_uart(cfg);
-        if(st->fd_uart<0) { vlog(1,"UART open failed (%s)", strerror(errno)); return -1; }
-        set_nonblock(st->fd_uart); add_ep(st->epfd, st->fd_uart, EPOLLIN);
-        vlog(1, "UART backend: tty dev=%s baud=%d %d%s%d flow=%s",
-             cfg->uart_device, cfg->uart_baud, cfg->uart_databits,
-             (!strcmp(cfg->uart_parity,"none")?"N":(!strcmp(cfg->uart_parity,"even")?"E":"O")),
-             cfg->uart_stopbits, cfg->uart_flow);
+    st->fd_uart = open_uart(cfg);
+    if (st->fd_uart < 0) {
+        vlog(1, "UART open failed (%s)", strerror(errno));
+        return -1;
     }
+    set_nonblock(st->fd_uart);
+    add_ep(st->epfd, st->fd_uart, EPOLLIN);
+    vlog(1, "UART backend: tty dev=%s baud=%d %d%s%d flow=%s",
+         cfg->uart_device, cfg->uart_baud, cfg->uart_databits,
+         (!strcmp(cfg->uart_parity, "none") ? "N" :
+          (!strcmp(cfg->uart_parity, "even") ? "E" : "O")),
+         cfg->uart_stopbits, cfg->uart_flow);
 
-    // UDP
-    st->fd_net=make_udp_bind(cfg->udp_bind_addr,cfg->udp_bind_port); if(st->fd_net<0){ vlog(1,"UDP bind failed (%s)", strerror(errno)); return -1; }
+    st->fd_net = make_udp_bind(cfg->udp_bind_addr, cfg->udp_bind_port);
+    if (st->fd_net < 0) {
+        vlog(1, "UDP bind failed (%s)", strerror(errno));
+        return -1;
+    }
     add_ep(st->epfd, st->fd_net, EPOLLIN);
-    if(cfg->udp_peer_addr[0]){
-        memset(&st->udp_peer,0,sizeof(st->udp_peer));
-        st->udp_peer.sin_family=AF_INET; st->udp_peer.sin_port=htons(cfg->udp_peer_port);
-        if(inet_pton(AF_INET,cfg->udp_peer_addr,&st->udp_peer.sin_addr)==1) st->udp_peer_set=true;
+    if (cfg->udp_peer_addr[0]) {
+        memset(&st->udp_peer, 0, sizeof(st->udp_peer));
+        st->udp_peer.sin_family = AF_INET;
+        st->udp_peer.sin_port = htons(cfg->udp_peer_port);
+        if (inet_pton(AF_INET, cfg->udp_peer_addr, &st->udp_peer.sin_addr) == 1) {
+            st->udp_peer_set = true;
+        }
     }
 
     vlog(1, "UDP peer: bind %s:%d -> peer %s:%d (coalesce=%dB/%dms, max=%dB)",
          cfg->udp_bind_addr, cfg->udp_bind_port,
-         cfg->udp_peer_addr[0]?cfg->udp_peer_addr:"(unset)", cfg->udp_peer_port,
+         cfg->udp_peer_addr[0] ? cfg->udp_peer_addr : "(unset)", cfg->udp_peer_port,
          cfg->udp_coalesce_bytes, cfg->udp_coalesce_idle_ms, cfg->udp_max_datagram);
     return 0;
+}
+
+static void disconnect_endpoints(state_t *st)
+{
+    if (st->fd_uart >= 0) {
+        del_ep(st->epfd, st->fd_uart);
+        close_fd(&st->fd_uart);
+    }
+    if (st->fd_net >= 0) {
+        del_ep(st->epfd, st->fd_net);
+        close_fd(&st->fd_net);
+    }
+    st->udp_peer_set = false;
+    st->udp_wait_writable = false;
+    st->udp_out_len = 0;
+    if (st->uart_out.len > 0) {
+        ring_consume(&st->uart_out, st->uart_out.len);
+    }
+}
+
+static void schedule_reconnect(state_t *st, struct timespec *reconnect_at,
+                               bool *reconnect_pending)
+{
+    disconnect_endpoints(st);
+    crsf_stream_reset(&st->crsf_uart_out);
+    *reconnect_pending = true;
+    get_mono(reconnect_at);
+    add_ms(reconnect_at, REOPEN_RETRY_MS);
 }
 
 /* ----------------------------- UDP coalescing ------------------------------- */
@@ -719,14 +676,6 @@ static void crsf_monitor_init(crsf_monitor_t *m, bool enabled,
     for (size_t i = 0; i < sizeof(known_types); i++) {
         m->recognized_types[known_types[i]] = true;
     }
-}
-
-static void crsf_monitor_set_enabled(crsf_monitor_t *m, bool enabled)
-{
-    if (m->enabled == enabled) return;
-    crsf_frame_handler_t cb = m->on_frame;
-    void *user = m->on_frame_user;
-    crsf_monitor_init(m, enabled, cb, user);
 }
 
 static void crsf_stream_reset(crsf_stream_t *s)
@@ -989,11 +938,8 @@ static void msp_monitor_print_report(telemetry_monitor_t *m, long long elapsed_m
 }
 
 /* Telemetry monitor wrapper */
-static void telemetry_monitor_init(telemetry_monitor_t *m, bool enabled, config_proto_t forced_proto,
-                                   crsf_frame_handler_t crsf_cb,
-                                   void *crsf_cb_user,
-                                   msp_frame_handler_t msp_cb,
-                                   void *msp_cb_user)
+static void telemetry_monitor_init(telemetry_monitor_t *m, bool enabled,
+                                   config_proto_t forced_proto)
 {
     memset(m, 0, sizeof(*m));
     m->enabled = enabled;
@@ -1003,23 +949,16 @@ static void telemetry_monitor_init(telemetry_monitor_t *m, bool enabled, config_
     if (forced_proto == PROTO_CRSF) p = TELEMETRY_PROTO_CRSF;
     else if (forced_proto == PROTO_MSP) p = TELEMETRY_PROTO_MSP;
     else if (forced_proto == PROTO_MAV) p = TELEMETRY_PROTO_MAV;
-    for(int i=0; i<CRSF_SRC_MAX; i++) m->protocol[i] = p;
+    for (int i = 0; i < CRSF_SRC_MAX; i++) m->protocol[i] = p;
 
-    m->crsf_cb = crsf_cb;
-    m->crsf_cb_user = crsf_cb_user;
-    m->msp_cb = msp_cb;
-    m->msp_cb_user = msp_cb_user;
-    crsf_monitor_init(&m->crsf, enabled, crsf_cb, crsf_cb_user);
+    crsf_monitor_init(&m->crsf, enabled, NULL, NULL);
 }
 
-static void telemetry_monitor_set_enabled(telemetry_monitor_t *m, bool enabled, config_proto_t forced_proto)
+static void telemetry_monitor_set_enabled(telemetry_monitor_t *m, bool enabled,
+                                          config_proto_t forced_proto)
 {
     if (m->enabled == enabled && m->config_proto == forced_proto) return;
-    crsf_frame_handler_t crsf_cb = m->crsf_cb;
-    void *crsf_user = m->crsf_cb_user;
-    msp_frame_handler_t msp_cb = m->msp_cb;
-    void *msp_user = m->msp_cb_user;
-    telemetry_monitor_init(m, enabled, forced_proto, crsf_cb, crsf_user, msp_cb, msp_user);
+    telemetry_monitor_init(m, enabled, forced_proto);
 }
 
 static void msp_stream_reset(msp_stream_t *s)
@@ -1104,14 +1043,6 @@ static void telemetry_monitor_feed_msp(telemetry_monitor_t *m, crsf_source_t src
                         uint8_t cmd = s->frame[4];
                         m->msp_type_counts[src][cmd]++;
 
-                        if (m->msp_cb) {
-                            // Frame structure: $ M < len cmd payload... checksum
-                            // cmd is at index 4, payload starts at 5, len is s->frame[3]
-                            size_t payload_len = s->frame[3];
-                            if (5 + payload_len < s->expected) {
-                                m->msp_cb(src, cmd, s->frame + 5, payload_len, m->msp_cb_user);
-                            }
-                        }
                     }
                 } else {
                     m->msp_invalid[src]++;
@@ -1252,400 +1183,6 @@ static void telemetry_monitor_maybe_report(telemetry_monitor_t *m)
     memset(m->msp_invalid, 0, sizeof(m->msp_invalid));
     memset(m->mav_frames, 0, sizeof(m->mav_frames));
     memset(m->mav_invalid, 0, sizeof(m->mav_invalid));
-}
-
-/* CRSF logging */
-typedef struct {
-    const config_t *cfg;
-    telemetry_log_state_t *log;
-    const state_t *st;
-} telemetry_log_ctx_t;
-
-static void telemetry_update_crsf(const config_t *cfg, telemetry_log_state_t *log, const state_t *st,
-                            crsf_source_t src, uint8_t type, const uint8_t *payload,
-                            size_t payload_len);
-
-static void telemetry_log_on_crsf_frame(crsf_source_t src, uint8_t type, const uint8_t *payload,
-                              size_t payload_len, void *user)
-{
-    telemetry_log_ctx_t *ctx = (telemetry_log_ctx_t *)user;
-    if (!ctx || !ctx->cfg || !ctx->log || !ctx->st) return;
-
-    telemetry_update_crsf(ctx->cfg, ctx->log, ctx->st, src, type, payload, payload_len);
-}
-
-static void telemetry_update_msp(const config_t *cfg, telemetry_log_state_t *log, const state_t *st,
-                           crsf_source_t src, uint8_t cmd, const uint8_t *payload,
-                           size_t payload_len);
-
-static void telemetry_log_on_msp_frame(crsf_source_t src, uint8_t cmd, const uint8_t *payload,
-                             size_t payload_len, void *user)
-{
-    telemetry_log_ctx_t *ctx = (telemetry_log_ctx_t *)user;
-    if (!ctx || !ctx->cfg || !ctx->log || !ctx->st) return;
-
-    telemetry_update_msp(ctx->cfg, ctx->log, ctx->st, src, cmd, payload, payload_len);
-}
-
-static void telemetry_log_reset(telemetry_log_state_t *log)
-{
-    memset(log, 0, sizeof(*log));
-}
-
-static void telemetry_log_init(telemetry_log_state_t *log, const config_t *cfg)
-{
-    bool new_enabled = (cfg->telemetry_proto != PROTO_OFF) && cfg->telemetry_log_enable && cfg->telemetry_log_path[0];
-
-    if (!new_enabled) {
-        telemetry_log_reset(log);
-        return;
-    }
-
-    if (!log->enabled) {
-        log->last_write.tv_sec = 0;
-        log->last_write.tv_nsec = 0;
-    }
-
-    log->enabled = true;
-}
-
-static const char *crsf_log_prefix(crsf_source_t src)
-{
-    return (src == CRSF_FROM_UART) ? "" : "udp_";
-}
-
-static void telemetry_log_write(const config_t *cfg, telemetry_log_state_t *log,
-                                 const state_t *st)
-{
-    if (!log->enabled || !st) return;
-
-    struct timespec now_ts;
-    get_mono(&now_ts);
-    double now_s = (double)now_ts.tv_sec + (double)now_ts.tv_nsec / 1e9;
-
-    // Maintain flight time state
-    for (int i = 0; i < CRSF_SRC_MAX; i++) {
-        telemetry_entry_t *entry = &log->entries[i];
-        if (entry->armed && !entry->prev_armed) {
-            entry->armed_start_time = now_s;
-        }
-        if (!entry->armed && entry->prev_armed) {
-            entry->armed_accumulated_s += (now_s - entry->armed_start_time);
-        }
-        entry->prev_armed = entry->armed;
-    }
-
-    if (log->last_write.tv_sec || log->last_write.tv_nsec) {
-        if (diff_ms(&now_ts, &log->last_write) < cfg->telemetry_log_interval) return;
-    }
-
-    FILE *f = fopen(cfg->telemetry_log_path, "w");
-    if (!f) {
-        vlog(2, "CRSF log: failed to open %s (%s)", cfg->telemetry_log_path, strerror(errno));
-        return;
-    }
-
-    long long elapsed_ms = 0;
-    if (log->last_rate.tv_sec || log->last_rate.tv_nsec) {
-        elapsed_ms = diff_ms(&now_ts, &log->last_rate);
-    }
-    if (elapsed_ms <= 0) {
-        log->last_pkts_uart_to_net = st->pkts_uart_to_net;
-        log->last_pkts_net_to_uart = st->pkts_net_to_uart;
-        log->last_rate = now_ts;
-        elapsed_ms = cfg->telemetry_log_interval;
-    }
-
-    uint64_t delta_tx = st->pkts_uart_to_net - log->last_pkts_uart_to_net;
-    uint64_t delta_rx = st->pkts_net_to_uart - log->last_pkts_net_to_uart;
-    double tx_pps = (double)delta_tx * 1000.0 / (double)elapsed_ms;
-    double rx_pps = (double)delta_rx * 1000.0 / (double)elapsed_ms;
-    log->tx_pps_hist[log->pps_hist_pos] = tx_pps;
-    log->rx_pps_hist[log->pps_hist_pos] = rx_pps;
-    if (log->pps_hist_count < 5) log->pps_hist_count++;
-    log->pps_hist_pos = (log->pps_hist_pos + 1) % 5;
-
-    double tx_pps_sum = 0.0, rx_pps_sum = 0.0;
-    for (size_t i = 0; i < log->pps_hist_count; i++) {
-        tx_pps_sum += log->tx_pps_hist[i];
-        rx_pps_sum += log->rx_pps_hist[i];
-    }
-    size_t recent_idx = (log->pps_hist_pos + 4) % 5;
-    double tx_recent = log->tx_pps_hist[recent_idx];
-    double rx_recent = log->rx_pps_hist[recent_idx];
-    double recent_weight = 2.0; /* bias toward the newest sample for responsiveness */
-    double tx_pps_avg = tx_pps_sum;
-    double rx_pps_avg = rx_pps_sum;
-    if (log->pps_hist_count > 0) {
-        tx_pps_avg = (tx_pps_sum - tx_recent + tx_recent * recent_weight) /
-                     (recent_weight + (double)(log->pps_hist_count - 1));
-        rx_pps_avg = (rx_pps_sum - rx_recent + rx_recent * recent_weight) /
-                     (recent_weight + (double)(log->pps_hist_count - 1));
-    }
-    double tx_kpkts = (double)st->pkts_uart_to_net / 1000.0;
-    double rx_kpkts = (double)st->pkts_net_to_uart / 1000.0;
-
-    fprintf(f, "tx_pps=%.1f\n", tx_pps_avg);
-    fprintf(f, "rx_pps=%.1f\n", rx_pps_avg);
-    fprintf(f, "tx_kpkts=%.1f\n", tx_kpkts);
-    fprintf(f, "rx_kpkts=%.1f\n", rx_kpkts);
-
-    log->last_pkts_uart_to_net = st->pkts_uart_to_net;
-    log->last_pkts_net_to_uart = st->pkts_net_to_uart;
-    log->last_rate = now_ts;
-
-    {
-        const telemetry_entry_t *entry = &log->entries[CRSF_FROM_UART];
-        const char *prefix = "";
-
-        if (entry->has_battery) {
-            fprintf(f, "%svoltage=%.1f\n", prefix, entry->voltage_v);
-            fprintf(f, "%scurrent=%.0f\n", prefix, entry->current_raw);
-            fprintf(f, "%scapacity=%u\n", prefix, entry->capacity_mah);
-            fprintf(f, "%sremaining=%u\n", prefix, (unsigned)entry->remaining_pct);
-        } else {
-            fprintf(f, "%svoltage=\n", prefix);
-            fprintf(f, "%scurrent=\n", prefix);
-            fprintf(f, "%scapacity=\n", prefix);
-            fprintf(f, "%sremaining=\n", prefix);
-        }
-
-        if (entry->has_gps) {
-            fprintf(f, "%slatitude=%.7f\n", prefix, entry->latitude_deg);
-            fprintf(f, "%slongitude=%.7f\n", prefix, entry->longitude_deg);
-            fprintf(f, "%sgroundspeed=%.0f\n", prefix, entry->groundspeed_raw);
-            fprintf(f, "%sheading=%.2f\n", prefix, entry->heading_deg);
-            fprintf(f, "%saltitude=%.2f\n", prefix, entry->altitude_m);
-            fprintf(f, "%ssats=%u\n", prefix, (unsigned)entry->sats);
-        } else {
-            fprintf(f, "%slatitude=\n", prefix);
-            fprintf(f, "%slongitude=\n", prefix);
-            fprintf(f, "%sgroundspeed=\n", prefix);
-            fprintf(f, "%sheading=\n", prefix);
-            fprintf(f, "%saltitude=\n", prefix);
-            fprintf(f, "%ssats=\n", prefix);
-        }
-
-        if (entry->has_any || entry->frames_rc || entry->frames_gps ||
-            entry->frames_battery || entry->frames_link_stats || entry->frames_other) {
-            double rc_kframes   = (double)entry->frames_rc / 1000.0;
-            double gps_kframes  = (double)entry->frames_gps / 1000.0;
-            double bat_kframes  = (double)entry->frames_battery / 1000.0;
-            double lnk_kframes  = (double)entry->frames_link_stats / 1000.0;
-            double oth_kframes  = (double)entry->frames_other / 1000.0;
-            fprintf(f, "%src_kframes=%.1f\n", prefix, rc_kframes);
-            fprintf(f, "%sgps_kframes=%.1f\n", prefix, gps_kframes);
-            fprintf(f, "%sbat_kframes=%.1f\n", prefix, bat_kframes);
-            fprintf(f, "%slnk_kframes=%.1f\n", prefix, lnk_kframes);
-            fprintf(f, "%sother_kframes=%.1f\n", prefix, oth_kframes);
-
-            if (entry->last_frame.tv_sec || entry->last_frame.tv_nsec) {
-                long long age_ms = diff_ms(&now_ts, &entry->last_frame);
-                if (age_ms < 0) age_ms = 0;
-                fprintf(f, "%slast_frame_age_ms=%lld\n", prefix, age_ms);
-            } else {
-                fprintf(f, "%slast_frame_age_ms=\n", prefix);
-            }
-        }
-
-        if (entry->has_status) {
-            fprintf(f, "%sarmed=%d\n", prefix, entry->armed);
-            fprintf(f, "%smode_flags=0x%08X\n", prefix, entry->flight_mode_flags);
-
-            unsigned int rssi_pct = (unsigned int)(((float)entry->rssi_raw / 1023.0f) * 100.0f);
-            if (rssi_pct > 100) rssi_pct = 100;
-            fprintf(f, "%sradio_rssi=%u\n", prefix, rssi_pct);
-        } else {
-            fprintf(f, "%sarmed=\n", prefix);
-            fprintf(f, "%smode_flags=\n", prefix);
-            fprintf(f, "%sradio_rssi=\n", prefix);
-        }
-
-        if (entry->has_home) {
-            fprintf(f, "%shome_dist=%.1f\n", prefix, entry->home_dist_m);
-            fprintf(f, "%shome_dir=%.1f\n", prefix, entry->home_dir_deg);
-        } else {
-            fprintf(f, "%shome_dist=\n", prefix);
-            fprintf(f, "%shome_dir=\n", prefix);
-        }
-
-        if (entry->has_baro) {
-            fprintf(f, "%sbaro_alt=%.1f\n", prefix, entry->baro_altitude_m);
-            fprintf(f, "%svario=%.1f\n", prefix, entry->vario_m_s);
-        } else {
-            fprintf(f, "%sbaro_alt=\n", prefix);
-            fprintf(f, "%svario=\n", prefix);
-        }
-
-        if (entry->has_attitude) {
-            fprintf(f, "%sroll=%.1f\n", prefix, entry->roll_deg);
-            fprintf(f, "%spitch=%.1f\n", prefix, entry->pitch_deg);
-        } else {
-            fprintf(f, "%sroll=\n", prefix);
-            fprintf(f, "%spitch=\n", prefix);
-        }
-
-        if (entry->armed_accumulated_s > 0 || entry->armed) {
-            double flight_time = entry->armed_accumulated_s;
-            if (entry->armed) {
-                flight_time += (now_s - entry->armed_start_time);
-            }
-            fprintf(f, "%sflight_time_s=%.1f\n", prefix, flight_time);
-        } else {
-            fprintf(f, "%sflight_time_s=\n", prefix);
-        }
-    }
-
-    fclose(f);
-    log->last_write = now_ts;
-}
-
-static void telemetry_update_crsf(const config_t *cfg, telemetry_log_state_t *log, const state_t *st,
-                            crsf_source_t src, uint8_t type, const uint8_t *payload,
-                            size_t payload_len)
-{
-    if (!log->enabled || src >= CRSF_SRC_MAX) return;
-
-    telemetry_entry_t *entry = &log->entries[src];
-    entry->has_any = true;
-    get_mono(&entry->last_frame);
-
-    if (type == 0x08 && payload_len >= 8) {
-        uint16_t voltage_raw = ((uint16_t)payload[0] << 8) | (uint16_t)payload[1];
-        uint16_t current_raw = ((uint16_t)payload[2] << 8) | (uint16_t)payload[3];
-        uint32_t capacity = ((uint32_t)payload[4] << 16) | ((uint32_t)payload[5] << 8) | (uint32_t)payload[6];
-        uint8_t remaining = payload[7];
-
-        entry->voltage_v = (double)voltage_raw / 10.0;
-        entry->current_raw = (double)current_raw;
-        entry->capacity_mah = capacity;
-        entry->remaining_pct = remaining;
-        entry->has_battery = true;
-        entry->frames_battery++;
-    } else if (type == 0x02 && payload_len >= 15) {
-        int32_t lat_raw = (int32_t)((uint32_t)payload[0] << 24 | (uint32_t)payload[1] << 16 |
-                                    (uint32_t)payload[2] << 8 | (uint32_t)payload[3]);
-        int32_t lon_raw = (int32_t)((uint32_t)payload[4] << 24 | (uint32_t)payload[5] << 16 |
-                                    (uint32_t)payload[6] << 8 | (uint32_t)payload[7]);
-        uint16_t groundspeed = ((uint16_t)payload[8] << 8) | (uint16_t)payload[9];
-        uint16_t heading = ((uint16_t)payload[10] << 8) | (uint16_t)payload[11];
-        uint16_t altitude = ((uint16_t)payload[12] << 8) | (uint16_t)payload[13];
-        uint8_t sats = payload[14];
-
-        entry->latitude_deg = (double)lat_raw / 1e7;
-        entry->longitude_deg = (double)lon_raw / 1e7;
-        entry->groundspeed_raw = (double)groundspeed;
-        entry->heading_deg = (double)heading / 100.0;
-        entry->altitude_m = (double)((int)altitude - 1000);
-        entry->sats = sats;
-        entry->has_gps = true;
-        entry->frames_gps++;
-    } else if (type == 0x16) {
-        entry->frames_rc++;
-    } else if (type == 0x14) {
-        entry->frames_link_stats++;
-    } else {
-        entry->frames_other++;
-    }
-
-    telemetry_log_write(cfg, log, st);
-}
-
-static void telemetry_update_msp(const config_t *cfg, telemetry_log_state_t *log, const state_t *st,
-                           crsf_source_t src, uint8_t cmd, const uint8_t *payload,
-                           size_t payload_len)
-{
-    if (!log->enabled || src >= CRSF_SRC_MAX) return;
-
-    telemetry_entry_t *entry = &log->entries[src];
-    entry->has_any = true;
-    get_mono(&entry->last_frame);
-
-    if (cmd == MSP_ANALOG && payload_len >= 7) {
-        // payload: vbat(1), powerMeterSum(2), rssi(2), amperage(2)
-        uint8_t vbat = payload[0];
-        uint16_t mah = ((uint16_t)payload[2] << 8) | (uint16_t)payload[1]; // Little endian? usually MSP is. actually bytes are LSB, MSB.
-        // Wait, MSP is LE. payload[1] is LSB, payload[2] is MSB.
-        uint16_t rssi = ((uint16_t)payload[4] << 8) | (uint16_t)payload[3];
-        uint16_t amperage = ((uint16_t)payload[6] << 8) | (uint16_t)payload[5];
-
-        entry->voltage_v = (double)vbat / 10.0;
-        entry->current_raw = (double)amperage;
-        if (!entry->capacity_mah) entry->capacity_mah = mah; // Prefer MSP_BATTERY_STATE if available
-        entry->rssi_raw = rssi;
-        entry->has_battery = true;
-        entry->has_status = true; // for rssi
-        entry->frames_battery++;
-    } else if (cmd == MSP_BATTERY_STATE && payload_len >= 5) {
-        // payload: amperage(2), capacity(2), voltage(1)
-        uint16_t amperage = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
-        uint16_t capacity = (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
-        uint8_t voltage = payload[4];
-
-        // entry->voltage_v = (double)voltage / 10.0; // Avoid conflict with MSP_ANALOG
-        // entry->current_raw = (double)amperage; // Avoid conflict with MSP_ANALOG
-        entry->capacity_mah = capacity;
-        entry->has_battery = true;
-        entry->frames_battery++;
-    } else if ((cmd == MSP_STATUS || cmd == MSP_STATUS_EX) && payload_len >= 10) {
-        // cycleTime(2), i2c_errors(2), sensor(2), flag(4)
-        uint32_t flags = (uint32_t)payload[6] | ((uint32_t)payload[7]<<8) | ((uint32_t)payload[8]<<16) | ((uint32_t)payload[9]<<24);
-
-        entry->flight_mode_flags = flags;
-        entry->armed = (flags & 1); // Box 0 is usually ARM
-        entry->has_status = true;
-        entry->frames_other++;
-    } else if (cmd == MSP_RAW_GPS && payload_len >= 16) {
-        // fix(1), numSat(1), lat(4), lon(4), alt(2), speed(2), ground_course(2)
-        uint8_t sats = payload[1];
-        int32_t lat = (int32_t)((uint32_t)payload[2] | ((uint32_t)payload[3]<<8) | ((uint32_t)payload[4]<<16) | ((uint32_t)payload[5]<<24));
-        int32_t lon = (int32_t)((uint32_t)payload[6] | ((uint32_t)payload[7]<<8) | ((uint32_t)payload[8]<<16) | ((uint32_t)payload[9]<<24));
-        int16_t alt = (int16_t)(payload[10] | (payload[11]<<8));
-        uint16_t speed = (uint16_t)(payload[12] | (payload[13]<<8));
-        uint16_t course = (uint16_t)(payload[14] | (payload[15]<<8));
-
-        entry->latitude_deg = (double)lat / 1e7;
-        entry->longitude_deg = (double)lon / 1e7;
-        entry->altitude_m = (double)alt; // meters (GPS)
-        entry->groundspeed_raw = (double)speed; // cm/s
-        entry->heading_deg = (double)course / 10.0;
-        entry->sats = sats;
-        entry->has_gps = true;
-        entry->frames_gps++;
-    } else if (cmd == MSP_COMP_GPS && payload_len >= 4) {
-        // distanceToHome(2), directionToHome(2)
-        uint16_t dist = (uint16_t)payload[0] | ((uint16_t)payload[1]<<8);
-        uint16_t dir = (uint16_t)payload[2] | ((uint16_t)payload[3]<<8);
-
-        entry->home_dist_m = (double)dist;
-        entry->home_dir_deg = (double)dir;
-        entry->has_home = true;
-        entry->frames_gps++;
-    } else if (cmd == MSP_ALTITUDE && payload_len >= 6) {
-        // EstAlt(4) cm, Vario(2) cm/s
-        int32_t alt_cm = (int32_t)((uint32_t)payload[0] | ((uint32_t)payload[1]<<8) | ((uint32_t)payload[2]<<16) | ((uint32_t)payload[3]<<24));
-        int16_t vario_cms = (int16_t)(payload[4] | (payload[5]<<8));
-
-        entry->baro_altitude_m = (double)alt_cm / 100.0;
-        entry->vario_m_s = (double)vario_cms / 100.0;
-        entry->has_baro = true;
-        entry->frames_other++;
-    } else if (cmd == MSP_ATTITUDE && payload_len >= 6) {
-        // roll(2), pitch(2), yaw(2)
-        int16_t roll = (int16_t)(payload[0] | (payload[1]<<8));
-        int16_t pitch = (int16_t)(payload[2] | (payload[3]<<8));
-        int16_t yaw = (int16_t)(payload[4] | (payload[5]<<8));
-
-        entry->roll_deg = (double)roll / 10.0;
-        entry->pitch_deg = (double)pitch / 10.0;
-        entry->heading_deg = (double)yaw / 10.0;
-        entry->has_attitude = true;
-        entry->frames_other++;
-    } else {
-        entry->frames_other++;
-    }
-
-    telemetry_log_write(cfg, log, st);
 }
 
 /* CRSF forwarding */
@@ -1795,8 +1332,7 @@ int main(int argc, char **argv){
         fprintf(stderr,"Failed to read config: %s (%s)\n", conf_path, strerror(errno));
         return 1;
     }
-    vlog(1, "Loaded config: uart_backend=%s",
-         (cfg.uart_backend==UART_TTY?"tty":"stdio"));
+    vlog(1, "Loaded config: uart_backend=tty");
 
     if (cfg.telemetry_proto != PROTO_OFF) {
         const char *pname = "Unknown";
@@ -1804,23 +1340,19 @@ int main(int argc, char **argv){
         else if (cfg.telemetry_proto == PROTO_MSP) pname = "MSP";
         else if (cfg.telemetry_proto == PROTO_MAV) pname = "MAVLink";
 
-        vlog(1, "Telemetry enabled: %s (Log: %s, Interval: %dms, Rate: %dHz)",
-             pname, cfg.telemetry_log_enable ? "On" : "Off",
-             cfg.telemetry_log_interval, cfg.telemetry_msp_rate);
+        vlog(1, "Telemetry enabled: %s (Rate: %dHz)",
+             pname, cfg.telemetry_msp_rate);
     } else {
         vlog(1, "Telemetry disabled");
     }
 
     state_t st; memset(&st,0,sizeof(st));
-    st.fd_uart=st.fd_net=-1; st.fd_stdout=-1;
+    st.fd_uart = st.fd_net = -1;
     st.epfd=epoll_create1(0); if(st.epfd<0){ perror("epoll_create1"); return 1; }
 
-    telemetry_log_init(&st.log_state, &cfg);
-
-    telemetry_log_ctx_t log_ctx = { .cfg = &cfg, .log = &st.log_state, .st = &st };
-    bool telemetry_enabled = (cfg.telemetry_proto != PROTO_OFF) && (g_verbosity || cfg.telemetry_log_enable);
+    bool telemetry_enabled = (cfg.telemetry_proto != PROTO_OFF) && g_verbosity;
     telemetry_monitor_t telemetry;
-    telemetry_monitor_init(&telemetry, telemetry_enabled, cfg.telemetry_proto, telemetry_log_on_crsf_frame, &log_ctx, telemetry_log_on_msp_frame, &log_ctx);
+    telemetry_monitor_init(&telemetry, telemetry_enabled, cfg.telemetry_proto);
 
     size_t udp_out_cap = cfg.udp_max_datagram>0?(size_t)cfg.udp_max_datagram:1200;
     st.udp_out=(uint8_t*)malloc(udp_out_cap);
@@ -1842,9 +1374,11 @@ int main(int argc, char **argv){
     struct sigaction sa={0}; sa.sa_handler=on_sighup; sigaction(SIGHUP,&sa,NULL);
     sa.sa_handler=on_sigterm; sigaction(SIGINT,&sa,NULL); sigaction(SIGTERM,&sa,NULL);
 
+    bool reconnect_pending = false;
+    struct timespec reconnect_at = {0};
     if(reopen_everything(&cfg,&st)<0){
-        fprintf(stderr,"Failed to open UART/STDIO/network (%s)\n", strerror(errno));
-        return 1;
+        fprintf(stderr,"Initial open failed (%s), retrying in %d ms\n", strerror(errno), REOPEN_RETRY_MS);
+        schedule_reconnect(&st, &reconnect_at, &reconnect_pending);
     }
 
     uint8_t *buf_uart=malloc(cfg.rx_buf), *buf_net=malloc(cfg.rx_buf);
@@ -1855,6 +1389,23 @@ int main(int argc, char **argv){
     reset_stats_window(&st);
 
     while(st.running && !g_stop){
+        if (reconnect_pending) {
+            struct timespec now;
+            get_mono(&now);
+            if (diff_ms(&now, &reconnect_at) >= 0) {
+                vlog(1, "Reopening UART/network after error");
+                if (reopen_everything(&cfg, &st) == 0) {
+                    reconnect_pending = false;
+                    get_mono(&st.last_uart_rx);
+                    reset_stats_window(&st);
+                    vlog(1, "Reopen successful");
+                } else {
+                    vlog(1, "Reopen failed (%s), retrying in %d ms", strerror(errno), REOPEN_RETRY_MS);
+                    schedule_reconnect(&st, &reconnect_at, &reconnect_pending);
+                }
+            }
+        }
+
         if(g_reload){
             vlog(1, "SIGHUP: reloading %s", conf_path);
             g_reload=0;
@@ -1894,10 +1445,10 @@ int main(int argc, char **argv){
                     vlog(1, "SIGHUP: reopen failed (%s), attempting to restore previous config", strerror(err));
                     if(reopen_everything(&oldcfg,&st)<0){
                         int restore_err = errno;
-                        vlog(0, "SIGHUP: failed to restore previous config (%s), stopping", strerror(restore_err));
+                        vlog(0, "SIGHUP: failed to restore previous config (%s), scheduling reopen", strerror(restore_err));
                         if(rx_resize){ free(new_buf_uart); free(new_buf_net); }
                         if(new_udp_out) free(new_udp_out);
-                        st.running=false;
+                        schedule_reconnect(&st, &reconnect_at, &reconnect_pending);
                         break;
                     }
                     cfg = oldcfg;
@@ -1910,8 +1461,7 @@ int main(int argc, char **argv){
                 cfg = newcfg;
 
                 telemetry_monitor_set_enabled(
-                    &telemetry, (cfg.telemetry_proto != PROTO_OFF) && (g_verbosity || cfg.telemetry_log_enable), cfg.telemetry_proto);
-                telemetry_log_init(&st.log_state, &cfg);
+                    &telemetry, (cfg.telemetry_proto != PROTO_OFF) && g_verbosity, cfg.telemetry_proto);
 
                 if(rx_resize){
                     free(buf_uart);
@@ -1938,15 +1488,21 @@ int main(int argc, char **argv){
 
                 get_mono(&st.last_uart_rx);
                 reset_stats_window(&st);
-                vlog(1, "SIGHUP: reload successful (uart_backend=%s)",
-                     (cfg.uart_backend==UART_TTY?"tty":"stdio"));
+                vlog(1, "SIGHUP: reload successful (uart_backend=tty)");
             } else {
                 vlog(1, "SIGHUP: parse failed, keeping previous config");
             }
         }
 
         int timeout_ms=500;
-        if (cfg.telemetry_proto == PROTO_MSP) {
+        if (reconnect_pending) {
+            struct timespec now;
+            get_mono(&now);
+            long long remain = diff_ms(&reconnect_at, &now);
+            if (remain < 0) remain = 0;
+            if (remain < timeout_ms) timeout_ms = (int)remain;
+        }
+        if (!reconnect_pending && cfg.telemetry_proto == PROTO_MSP) {
             struct timespec now; get_mono(&now);
             long long since_poll = diff_ms(&now, &st.last_msp_poll);
             long long poll_rate = 1000 / cfg.telemetry_msp_rate;
@@ -1993,12 +1549,9 @@ int main(int argc, char **argv){
             mod_ep(st.epfd, st.fd_net, net_events);
         }
 
-        if(cfg.uart_backend==UART_TTY){
-            uint32_t uart_events = EPOLLIN | (st.uart_out.len>0?EPOLLOUT:0);
+        if(st.fd_uart>=0){
+            uint32_t uart_events = EPOLLIN | (st.uart_out.len > 0 ? EPOLLOUT : 0);
             mod_ep(st.epfd, st.fd_uart, uart_events);
-        } else {
-            if(st.uart_out.len>0 && !st.stdout_registered){ add_ep(st.epfd, STDOUT_FILENO, EPOLLOUT); st.stdout_registered=true; }
-            else if(st.uart_out.len==0 && st.stdout_registered){ del_ep(st.epfd, STDOUT_FILENO); st.stdout_registered=false; }
         }
 
         struct epoll_event evs[MAX_EVENTS]; int n=epoll_wait(st.epfd, evs, MAX_EVENTS, timeout_ms);
@@ -2013,6 +1566,13 @@ int main(int argc, char **argv){
 
         for(int i=0;i<n;i++){
             int fd=evs[i].data.fd; uint32_t ev=evs[i].events;
+
+            if (ev & (EPOLLERR | EPOLLHUP)) {
+                if (fd == st.fd_uart) vlog(1, "UART: epoll error/hup");
+                else if (fd == st.fd_net) vlog(1, "UDP: epoll error/hup");
+                schedule_reconnect(&st, &reconnect_at, &reconnect_pending);
+                break;
+            }
 
             if(fd==st.fd_uart && (ev&EPOLLIN)){
                 ssize_t r=read(st.fd_uart,(void*)buf_uart,cfg.rx_buf);
@@ -2032,6 +1592,10 @@ int main(int argc, char **argv){
                     } else {
                         uart_forward_with_coalesce(&cfg, &st, buf_uart, (size_t)r);
                     }
+                } else if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    vlog(1, "UART read failed (%s)", strerror(errno));
+                    schedule_reconnect(&st, &reconnect_at, &reconnect_pending);
+                    break;
                 }
             }
 
@@ -2053,29 +1617,28 @@ int main(int argc, char **argv){
                             vlog(1, "UDP: learned peer %s:%d", ipbuf, ntohs(from.sin_port));
                         }
                     }
-                    int outfd = (cfg.uart_backend==UART_STDIO)? STDOUT_FILENO : st.fd_uart;
-                    ssize_t w=write(outfd, buf_net, (size_t)r);
+                    ssize_t w=write(st.fd_uart, buf_net, (size_t)r);
                     if(w>0){
                         st.bytes_net_to_uart+=(uint64_t)w; st.pkts_net_to_uart+=1;
                         if(w<r){
                             size_t rem=(size_t)r-(size_t)w;
                             size_t wr=ring_write(&st.uart_out, buf_net+w, rem);
                             if(wr<rem) st.drops_net_to_uart+=(uint64_t)(rem-wr);
-                            if(cfg.uart_backend==UART_STDIO){
-                                if(!st.stdout_registered){ add_ep(st.epfd, STDOUT_FILENO, EPOLLOUT); st.stdout_registered=true; }
-                            } else {
-                                mod_ep(st.epfd, st.fd_uart, EPOLLIN|EPOLLOUT);
-                            }
-                        }
-                    } else if(w<0 && (errno==EAGAIN||errno==EWOULDBLOCK)){
-                        size_t wr=ring_write(&st.uart_out, buf_net, (size_t)r);
-                        if(wr<(size_t)r) st.drops_net_to_uart+=(uint64_t)((size_t)r-wr);
-                        if(cfg.uart_backend==UART_STDIO){
-                            if(!st.stdout_registered){ add_ep(st.epfd, STDOUT_FILENO, EPOLLOUT); st.stdout_registered=true; }
-                        } else {
                             mod_ep(st.epfd, st.fd_uart, EPOLLIN|EPOLLOUT);
                         }
+                    } else if(w==0 || (w<0 && (errno==EAGAIN||errno==EWOULDBLOCK))){
+                        size_t wr=ring_write(&st.uart_out, buf_net, (size_t)r);
+                        if(wr<(size_t)r) st.drops_net_to_uart+=(uint64_t)((size_t)r-wr);
+                        mod_ep(st.epfd, st.fd_uart, EPOLLIN|EPOLLOUT);
+                    } else if (w < 0) {
+                        vlog(1, "UART write failed (%s)", strerror(errno));
+                        schedule_reconnect(&st, &reconnect_at, &reconnect_pending);
+                        break;
                     }
+                } else if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    vlog(1, "UDP recv failed (%s)", strerror(errno));
+                    schedule_reconnect(&st, &reconnect_at, &reconnect_pending);
+                    break;
                 }
             }
 
@@ -2083,14 +1646,17 @@ int main(int argc, char **argv){
                 if(st.udp_out_len>0) udp_flush_if_ready(&cfg,&st,true,"retry");
             }
 
-            if(cfg.uart_backend==UART_TTY && fd==st.fd_uart && (ev&EPOLLOUT)){
-                if(st.uart_out.len>0){ ssize_t w=write_from_ring_fd(st.fd_uart,&st.uart_out); if(w>0) st.bytes_net_to_uart+=(uint64_t)w; }
+            if(fd==st.fd_uart && (ev&EPOLLOUT)){
+                if(st.uart_out.len>0){
+                    ssize_t w=write_from_ring_fd(st.fd_uart,&st.uart_out);
+                    if(w>0) st.bytes_net_to_uart+=(uint64_t)w;
+                    else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        vlog(1, "UART buffered write failed (%s)", strerror(errno));
+                        schedule_reconnect(&st, &reconnect_at, &reconnect_pending);
+                        break;
+                    }
+                }
                 uint32_t want=EPOLLIN | (st.uart_out.len?EPOLLOUT:0); mod_ep(st.epfd, st.fd_uart, want);
-            }
-
-            if(cfg.uart_backend==UART_STDIO && st.stdout_registered && fd==STDOUT_FILENO && (ev&EPOLLOUT)){
-                if(st.uart_out.len>0){ ssize_t w=write_from_ring_fd(STDOUT_FILENO,&st.uart_out); if(w>0) st.bytes_net_to_uart+=(uint64_t)w; }
-                if(st.uart_out.len==0){ del_ep(st.epfd, STDOUT_FILENO); st.stdout_registered=false; }
             }
         }
 
@@ -2098,16 +1664,14 @@ int main(int argc, char **argv){
             st.udp_out_len >= (size_t)cfg.udp_coalesce_bytes ? "size_threshold" : "pending");
         maybe_print_stats(&st);
         telemetry_monitor_maybe_report(&telemetry);
-        telemetry_log_write(&cfg, &st.log_state, &st);
     }
 
     maybe_print_stats(&st);
     telemetry_monitor_maybe_report(&telemetry);
     vlog(1, "Exiting");
 
-    if(cfg.uart_backend==UART_TTY && st.fd_uart>=0) del_ep(st.epfd,st.fd_uart), close_fd(&st.fd_uart);
+    if(st.fd_uart>=0) del_ep(st.epfd,st.fd_uart), close_fd(&st.fd_uart);
     if(st.fd_net>=0) del_ep(st.epfd,st.fd_net), close_fd(&st.fd_net);
-    if(st.stdout_registered){ del_ep(st.epfd, STDOUT_FILENO); }
     if(st.epfd>=0) close(st.epfd);
     free(buf_uart); free(buf_net);
     ring_free(&st.uart_out);
